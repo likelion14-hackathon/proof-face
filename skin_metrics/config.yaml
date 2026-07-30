@@ -1,0 +1,94 @@
+# skin_metrics configuration
+# ---------------------------------------------------------------------------
+# IMPORTANT: All reference-distribution numbers below are PLACEHOLDER values
+# loosely informed by the literature. They are NOT calibrated to any specific
+# camera/population. Replace them with values fitted on your own reference
+# cohort before trusting absolute scores.
+# TODO(reference-cohort): re-fit `reference.<metric>.<fitzpatrick>.{mean,std}`
+#       from a labelled reference dataset captured with the target camera.
+# ---------------------------------------------------------------------------
+
+disclaimer: >
+  This system is not a medical device. Results are cosmetic reference
+  information only and must not be used for diagnostic purposes.
+
+# --- artifact-masking thresholds (detection/face.py) -----------------------
+masking:
+  glare_v_min: 0.92       # HSV V above this (0-1) is candidate specular glare
+  glare_s_max: 0.15       # ...AND HSV S below this -> specular highlight
+  shadow_percentile: 5.0  # L* below this percentile within ROI -> shadow
+  min_valid_ratio: 0.60   # ROI dropped (None) if valid-pixel ratio < this
+
+# --- Fitzpatrick estimation from ITA (features/pigmentation.ita) -----------
+# Boundaries are the widely-cited ITA cut-offs (Del Bino et al.).
+# Type index is 1..6; higher = darker skin.
+fitzpatrick:
+  ita_boundaries: [55.0, 41.0, 28.0, 10.0, -30.0]
+  # ITA > 55 -> type 1 (very light); ITA <= -30 -> type 6 (dark)
+
+# --- specular / hydration proxy thresholds ---------------------------------
+hydration_proxy:
+  specular_v_min: 0.90
+  specular_s_max: 0.20
+
+# --- scoring orientation ---------------------------------------------------
+# Each score is a 0-100 "condition index" where HIGHER = MORE pronounced:
+#   pigmentation: more/darker pigmentation
+#   erythema:     more redness
+#   hydration:    DRIER (less hydrated).  NOTE: this is a PROXY, is_estimate=True.
+scoring:
+  clip_z: 4.0             # clip z-scores to +/- this before CDF mapping
+
+# --- reference distributions per metric, per Fitzpatrick type --------------
+# The pipeline builds one composite raw value per metric (see scoring/normalize.py),
+# then maps it to a percentile using a normal CDF with the mean/std below.
+# Keys "1".."6" are Fitzpatrick types; "default" is the fallback.
+reference:
+  pigmentation:
+    default: { mean: 0.0, std: 1.0 }
+    "1": { mean: -0.20, std: 0.90 }
+    "2": { mean: -0.10, std: 0.95 }
+    "3": { mean: 0.00, std: 1.00 }
+    "4": { mean: 0.10, std: 1.00 }
+    "5": { mean: 0.20, std: 1.05 }
+    "6": { mean: 0.30, std: 1.10 }
+  erythema:
+    default: { mean: 0.0, std: 1.0 }
+    "1": { mean: 0.10, std: 1.05 }
+    "2": { mean: 0.05, std: 1.00 }
+    "3": { mean: 0.00, std: 1.00 }
+    "4": { mean: -0.05, std: 0.98 }
+    "5": { mean: -0.10, std: 0.95 }
+    "6": { mean: -0.15, std: 0.95 }
+  hydration:
+    default: { mean: 0.0, std: 1.0 }
+    "1": { mean: 0.00, std: 1.00 }
+    "2": { mean: 0.00, std: 1.00 }
+    "3": { mean: 0.00, std: 1.00 }
+    "4": { mean: 0.00, std: 1.00 }
+    "5": { mean: 0.00, std: 1.00 }
+    "6": { mean: 0.00, std: 1.00 }
+
+# Composite raw-value weights (z-scored sub-features are combined with these).
+# Sub-feature raw->z uses the population anchors below (also placeholders).
+composite:
+  pigmentation:
+    weights: { melanin_index: 0.4, spot_area_ratio: 0.3, evenness: 0.2, ita_inv: 0.1 }
+    anchors:
+      melanin_index:   { mean: 40.0, std: 12.0 }
+      spot_area_ratio: { mean: 0.03, std: 0.03 }
+      evenness:        { mean: 4.0,  std: 2.0 }
+      ita_inv:         { mean: 0.0,  std: 25.0 }   # ita_inv = -ITA (higher=darker)
+  erythema:
+    weights: { erythema_index: 0.4, mean_a_star: 0.3, hemoglobin: 0.3 }
+    anchors:
+      erythema_index: { mean: 8.0,  std: 6.0 }
+      mean_a_star:    { mean: 12.0, std: 4.0 }
+      hemoglobin:     { mean: 0.0,  std: 1.0 }
+  hydration:
+    weights: { scaling_index: 0.35, glcm_contrast: 0.25, wrinkle_density: 0.25, specular_inv: 0.15 }
+    anchors:
+      scaling_index:   { mean: 0.10, std: 0.06 }
+      glcm_contrast:   { mean: 50.0, std: 30.0 }
+      wrinkle_density: { mean: 0.02, std: 0.02 }
+      specular_inv:    { mean: 0.0,  std: 0.05 }   # specular_inv = -specular_ratio (drier=less shine)

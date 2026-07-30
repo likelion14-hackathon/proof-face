@@ -1,0 +1,162 @@
+"""Command-line interface for skin_metrics.
+
+Examples
+--------
+    skin-metrics analyze face.jpg --reference-bbox 10,10,40,40 --output report.json
+    skin-metrics compare before.jpg after.jpg
+    skin-metrics train --data data/labels.csv --config skin_metrics/config.yaml
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import typer
+
+from . import DISCLAIMER
+from .config import load_config
+
+app = typer.Typer(
+    add_completion=False,
+    help="Camera-based skin metric quantification (NOT a medical device).",
+)
+
+
+def _read_image(path: Path) -> np.ndarray:
+    """Read an image file as an RGB array."""
+    from skimage.io import imread
+
+    img = imread(str(path))
+    if img.ndim == 2:  # grayscale -> RGB
+        img = np.stack([img] * 3, axis=-1)
+    if img.shape[-1] == 4:  # drop alpha
+        img = img[..., :3]
+    return img
+
+
+def _parse_bbox(bbox: Optional[str]) -> Optional[tuple[int, int, int, int]]:
+    if bbox is None:
+        return None
+    parts = [int(p) for p in bbox.split(",")]
+    if len(parts) != 4:
+        raise typer.BadParameter("reference-bbox must be 'x,y,w,h'")
+    return (parts[0], parts[1], parts[2], parts[3])
+
+
+@app.command()
+def analyze(
+    image: Path = typer.Argument(..., exists=True, help="Face image file."),
+    reference_bbox: Optional[str] = typer.Option(
+        None, "--reference-bbox", help="Neutral gray/white patch 'x,y,w,h'."
+    ),
+    output: Optional[Path] = typer.Option(None, "--output", help="Write JSON report here."),
+    model: Optional[Path] = typer.Option(
+        None, "--model", help="face_landmarker.task path (MediaPipe Tasks API)."
+    ),
+    download_model: bool = typer.Option(
+        False, "--download-model", help="Download the FaceLandmarker model (~3.8MB) if missing."
+    ),
+    config: Optional[Path] = typer.Option(None, "--config", help="Config YAML path."),
+) -> None:
+    """Analyze one face image and print/write a JSON SkinReport."""
+    from .pipeline import analyze as run_analyze
+
+    cfg = load_config(config)
+    model_path = str(model) if model else None
+    if download_model:
+        from .detection.face import ensure_face_model
+
+        model_path = str(ensure_face_model(model_path))
+        typer.echo(f"Face model ready at {model_path}")
+
+    img = _read_image(image)
+    report = run_analyze(
+        img, ref_bbox=_parse_bbox(reference_bbox), model_path=model_path, config=cfg
+    )
+
+    payload = report.model_dump()
+    text = json.dumps(payload, indent=2, ensure_ascii=False)
+    if output is not None:
+        output.write_text(text, encoding="utf-8")
+        typer.echo(f"Wrote report to {output}")
+    else:
+        typer.echo(text)
+
+
+@app.command()
+def compare(
+    image1: Path = typer.Argument(..., exists=True, help="Baseline image."),
+    image2: Path = typer.Argument(..., exists=True, help="Current image."),
+    reference_bbox: Optional[str] = typer.Option(None, "--reference-bbox"),
+    output: Optional[Path] = typer.Option(None, "--output"),
+    config: Optional[Path] = typer.Option(None, "--config"),
+) -> None:
+    """Compare two images (baseline vs current) and report score changes."""
+    from .pipeline import analyze as run_analyze
+    from .scoring.normalize import compare as compare_scores
+
+    cfg = load_config(config)
+    bbox = _parse_bbox(reference_bbox)
+    r1 = run_analyze(_read_image(image1), ref_bbox=bbox, config=cfg)
+    r2 = run_analyze(_read_image(image2), ref_bbox=bbox, config=cfg)
+
+    baseline = {
+        "pigmentation": r1.pigmentation.score,
+        "erythema": r1.erythema.score,
+        "hydration": r1.hydration.score,
+    }
+    current = {
+        "pigmentation": r2.pigmentation.score,
+        "erythema": r2.erythema.score,
+        "hydration": r2.hydration.score,
+    }
+    result = {
+        "baseline": baseline,
+        "current": current,
+        "changes": compare_scores(current, baseline),
+        "disclaimer": DISCLAIMER,
+    }
+    text = json.dumps(result, indent=2, ensure_ascii=False)
+    if output is not None:
+        output.write_text(text, encoding="utf-8")
+        typer.echo(f"Wrote comparison to {output}")
+    else:
+        typer.echo(text)
+
+
+@app.command()
+def train(
+    data: Optional[Path] = typer.Option(None, "--data", help="Label CSV (optional)."),
+    config: Optional[Path] = typer.Option(None, "--config"),
+    mode: str = typer.Option("regression", "--mode", help="'regression' or 'ranking'."),
+    epochs: int = typer.Option(3, "--epochs"),
+    dummy: bool = typer.Option(
+        False, "--dummy", help="Use the synthetic dummy dataset (no labels needed)."
+    ),
+) -> None:
+    """Train the Phase 2 model (requires the 'dl' extra: `uv sync --extra dl`)."""
+    try:
+        from .models.train import run_training
+    except ImportError as exc:
+        typer.echo(
+            "Phase 2 requires the 'dl' extra. Install with: uv sync --extra dl\n"
+            f"({exc})"
+        )
+        raise typer.Exit(code=1)
+
+    cfg = load_config(config)
+    run_training(
+        data_csv=data, config=cfg, mode=mode, epochs=epochs, use_dummy=dummy or data is None
+    )
+
+
+@app.callback()
+def _main() -> None:
+    """skin-metrics CLI."""
+
+
+if __name__ == "__main__":  # pragma: no cover
+    app()

@@ -1,0 +1,49 @@
+[project]
+name = "skin-metrics"
+version = "0.1.0"
+description = "Camera-based skin metric quantification (pigmentation / erythema / hydration proxy)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "scikit-image>=0.22",
+    "scikit-learn>=1.3",
+    "opencv-python-headless>=4.9",
+    "colour-science>=0.4.4",
+    "pydantic>=2.6",
+    "typer>=0.12",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Heavy, lazily-imported deps. Phase 1 unit tests do NOT need these.
+detection = [
+    "mediapipe>=0.10.9",
+]
+dl = [
+    "torch>=2.2",
+    "timm>=0.9.16",
+    "albumentations>=1.4",
+    "pandas>=2.1",
+]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+skin-metrics = "skin_metrics.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["skin_metrics"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
