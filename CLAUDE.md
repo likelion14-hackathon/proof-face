@@ -10,11 +10,13 @@
 **Phase 1(물리 기반, 학습 불필요)** 이 실제 "이미지→지수" 엔진이고,
 **Phase 2(딥러닝)** 는 실측 라벨이 생기면 붙일 수 있는 **완전히 도는 스캐폴드**.
 
-## 현재 상태 (2026-07-31 기준)
+## 현재 상태 (2026-08-09 기준)
 
-- ✅ **Phase 1 완료** — 전 모듈 구현, 단위 테스트 **56개 통과**.
+- ✅ **Phase 1 완료** — 전 모듈 구현, 단위 테스트 **81개 통과**(API 25개 포함).
 - ✅ **Phase 2 스캐폴드 완료** — dataset(+더미)/network/train, 더미로 학습 루프 end-to-end 확인.
 - ✅ 실제 이미지 경로(MediaPipe **Tasks API**) 동작하도록 `detect_landmarks` 이중 API 지원.
+- ✅ **HTTP API 완료** (`skin_metrics/api/`, `api` extra) — `POST /analyze`(이미지 URL) /
+  `GET /healthz`. 실제 사진으로 end-to-end 확인(36MP → 약 66초).
 - ⏳ 미완/의도적 보류: `config.yaml` 레퍼런스 분포는 **placeholder**(재추정 필요),
   Phase 2는 **실측 라벨 CSV 부재로 절대값 무의미**(더미/ranking만 검증됨).
 
@@ -30,11 +32,14 @@
   - core: numpy/scipy/scikit-image/scikit-learn/opencv-headless/colour-science/pydantic/typer/pyyaml
   - `detection` extra: `mediapipe` (실이미지 얼굴 검출)
   - `dl` extra: `torch`/`timm`/`albumentations`/`pandas`
+  - `api` extra: `fastapi`/`uvicorn`/`httpx` (Pillow는 scikit-image 스택에 이미 있음)
   - `dev` extra: `pytest`
   ```bash
   uv sync --extra dev                        # Phase 1 개발/테스트
-  uv sync --extra detection --extra dl --extra dev   # 전체
+  uv sync --extra detection --extra dl --extra api --extra dev   # 전체
   ```
+  ⚠️ `uv sync`는 **지정한 extra만 남기고 나머지는 제거**합니다. 일부만 sync하면
+  `cv2`(mediapipe 스택)가 빠져 테스트가 깨질 수 있으니 전체 sync 줄을 쓰세요.
 - **설치된 버전 특이점**:
   - `mediapipe 1.0.0` — 레거시 `mp.solutions.face_mesh` **없음**, **Tasks API만** 존재.
     `detect_landmarks`는 둘 다 지원하지만 이 환경에선 Tasks 경로를 탐. `face_landmarker.task`
@@ -49,6 +54,8 @@ uv run pytest -q                                   # 전체 테스트 (56)
 uv run pytest tests/test_models.py -q              # Phase 2만 (torch 필요)
 uv run skin-metrics analyze data/test2.jpg --download-model --output report.json
 uv run skin-metrics train --dummy --mode ranking --epochs 1
+uv run skin-metrics serve --download-model                # HTTP API (/docs)
+uv run pytest tests/test_api.py -q                        # API만 (fastapi 필요)
 ```
 
 ## 아키텍처 지도 (수정 시 진입점)
@@ -62,6 +69,17 @@ pipeline.analyze(img, ref_bbox, ccm, landmarks, model_path, config)  # ← 전�
 ├─ features.{pigmentation,erythema,hydration_proxy}      (ROI valid_mask 내부만 연산)
 └─ scoring.normalize.score_metric (composite_raw → score_from_raw, Fitzpatrick별)
       → scoring.schema.SkinReport (pydantic, 의료 고지 포함)
+```
+
+HTTP API (`api` extra):
+```
+api.app.create_app(settings) → FastAPI          # 모듈 최상단 app = create_app() (uvicorn 타깃)
+├─ lifespan: load_config / ensure|resolve_face_model / anyio.Semaphore / 공유 httpx.AsyncClient
+├─ GET  /healthz  → face_model_available · detection_available
+└─ POST /analyze  → api.fetch.fetch_image(URL 검증·스트리밍·디코딩)
+                  → anyio.to_thread.run_sync(pipeline.analyze)  # CPU 바운드
+                  → AnalyzeResponse(report, source, elapsed_ms)
+api.settings.ApiSettings.from_env()  # SKIN_METRICS_API_* (한도·타임아웃·동시성)
 ```
 
 Phase 2: `models.dataset(SkinDataset/DummyLabelGenerator)` → `models.network.SkinNet`
@@ -92,6 +110,15 @@ Phase 2: `models.dataset(SkinDataset/DummyLabelGenerator)` → `models.network.S
   README "배경 영향" 참고.)
 - **Tasks API는 478점 반환** (468 mesh + iris). `[:468]`만 사용 중.
 - **ranking 모드의 MAE는 무의미** (절대 스케일 미보정). Pearson/Spearman로 판단.
+- **API의 `from __future__ import annotations` + 지역 import 조합 금지**: FastAPI는 문자열
+  애노테이션을 **모듈 전역**에서 해석하므로 `Request`를 함수 안에서 import하면 경로 파라미터로
+  오인해 전 요청이 422가 됩니다. `api/app.py`의 fastapi/anyio/httpx는 최상단 import 유지
+  (지연 import 규칙의 예외 — 이 모듈 자체가 `api` extra 전용).
+- **API 테스트는 실제 루프백 HTTP 서버**를 씁니다(외부 네트워크 없음). mediapipe 없이 돌도록
+  `skin_metrics.pipeline.detect_landmarks`를 monkeypatch → 랜드마크 지오메트리를 바꾸면
+  `tests/test_api.py`도 같이 확인.
+- **SSRF 가드 해제 플래그**(`--allow-private-hosts` / `SKIN_METRICS_API_ALLOW_PRIVATE_HOSTS`)는
+  개발·테스트 전용. 배포 설정에 새지 않게 할 것.
 
 ## 이어서 하면 좋은 작업 (Next steps)
 
@@ -104,6 +131,9 @@ Phase 2: `models.dataset(SkinDataset/DummyLabelGenerator)` → `models.network.S
    `erythema._HEMOGLOBIN_DIR/_MELANIN_DIR` 대체.
 5. **실제 얼굴 사진 end-to-end 검증**: `data/`에 사진 두고 `analyze --download-model` 실행,
    ROI 마스킹·Fitzpatrick 추정 품질 육안 확인.
+6. **API 처리량**: 36MP 사진 1건 ≈ 66초(동기 HTTP로는 과함). 다운스케일 정책(텍스처 지표
+   영향 측정 후) 또는 작업 큐 + 작업 ID 폴링(`202 → /jobs/{id}`) 도입 검토. 인증·레이트리밋도
+   아직 없음(현재는 신뢰된 네트워크 뒤 배포 가정).
 
 ## 결정 로그 (왜 이렇게 했나)
 

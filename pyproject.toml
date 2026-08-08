@@ -28,6 +28,12 @@ dl = [
     "albumentations>=1.4",
     "pandas>=2.1",
 ]
+# HTTP API (skin_metrics.api). Pillow ships with scikit-image's imageio stack.
+api = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "httpx>=0.27",
+]
 dev = [
     "pytest>=8.0",
 ]

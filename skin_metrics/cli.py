@@ -153,6 +153,45 @@ def train(
     )
 
 
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind address."),
+    port: int = typer.Option(8000, "--port", help="Bind port."),
+    reload: bool = typer.Option(False, "--reload", help="Auto-reload on code changes (dev)."),
+    download_model: bool = typer.Option(
+        False, "--download-model", help="Download the FaceLandmarker model at startup if missing."
+    ),
+    config: Optional[Path] = typer.Option(None, "--config", help="Config YAML path."),
+    allow_private_hosts: bool = typer.Option(
+        False,
+        "--allow-private-hosts",
+        help="DEV ONLY: allow image URLs pointing at localhost/private networks (disables the "
+        "SSRF guard).",
+    ),
+) -> None:
+    """Serve the HTTP API (requires the 'api' extra: `uv sync --extra api`)."""
+    import os
+
+    try:
+        import uvicorn
+    except ImportError as exc:
+        typer.echo(f"The API requires the 'api' extra. Install with: uv sync --extra api\n({exc})")
+        raise typer.Exit(code=1)
+
+    # create_app() reads settings from the environment; mirror the flags there so
+    # that --reload (which re-imports the app in a subprocess) sees them too.
+    if config is not None:
+        os.environ["SKIN_METRICS_API_CONFIG"] = str(config)
+    if download_model:
+        os.environ["SKIN_METRICS_API_DOWNLOAD_MODEL"] = "1"
+    if allow_private_hosts:
+        os.environ["SKIN_METRICS_API_ALLOW_PRIVATE_HOSTS"] = "1"
+        typer.echo("WARNING: private/loopback image URLs are allowed (SSRF guard off).")
+
+    typer.echo(f"Serving skin-metrics API on http://{host}:{port} (docs at /docs)")
+    uvicorn.run("skin_metrics.api.app:app", host=host, port=port, reload=reload)
+
+
 @app.callback()
 def _main() -> None:
     """skin-metrics CLI."""

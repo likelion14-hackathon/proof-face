@@ -17,6 +17,7 @@
 - [Phase 2: 딥러닝 (기술 상세)](#phase-2-딥러닝-기술-상세)
 - [점수 해석 · 신뢰도 · 보정](#점수-해석--신뢰도--보정)
 - [CLI 레퍼런스](#cli-레퍼런스)
+- [HTTP API](#http-api)
 - [테스트](#테스트)
 - [알려진 한계 · TODO](#알려진-한계--todo)
 
@@ -34,6 +35,9 @@ uv sync --extra detection
 # Phase 2 딥러닝
 uv sync --extra dl
 
+# HTTP API (이미지 URL → 분석)
+uv sync --extra api --extra detection
+
 # 분석 (venv 활성화 시 uv 없이 skin-metrics 직접 실행 가능)
 # 첫 실행: --download-model 로 FaceLandmarker 모델(~3.8MB) 자동 다운로드
 skin-metrics analyze data/test2.jpg --download-model --output report.json
@@ -49,6 +53,12 @@ skin-metrics compare data/test-image.jpg data/test2.jpg
 
 # Phase 2 딥러닝 스캐폴드 (라벨 없이 더미로 학습 루프 검증)
 skin-metrics train --dummy --mode ranking --epochs 3
+
+# HTTP API 서버 (docs: http://127.0.0.1:8000/docs)
+skin-metrics serve --download-model
+curl -X POST http://127.0.0.1:8000/analyze \
+  -H 'content-type: application/json' \
+  -d '{"image_url": "https://example.com/face.jpg"}'
 ```
 
 > `uv`는 `~/Library/Python/3.9/bin`에 설치됩니다. PATH에 없으면 전체 경로로 부르거나,
@@ -86,10 +96,15 @@ skin_metrics/
 │   ├── normalize.py         # Fitzpatrick 타입별 백분위 정규화, compare()
 │   └── schema.py            # pydantic SkinReport / MetricScore
 ├── models/                  # Phase 2: dataset(+dummy) / network / train
+├── api/                     # HTTP API (FastAPI)
+│   ├── app.py               # /healthz, /analyze 엔드포인트 + lifespan
+│   ├── fetch.py             # 이미지 URL 다운로드 (SSRF·크기 가드)
+│   ├── schemas.py           # 요청/응답 pydantic 모델
+│   └── settings.py          # SKIN_METRICS_API_* 환경변수 설정
 ├── pipeline.py              # image -> SkinReport 오케스트레이션
 ├── config.py / config.yaml  # 설정 로더 / 임계값·레퍼런스 분포
-└── cli.py                   # typer: analyze / compare / train
-tests/                       # 합성 이미지·랜드마크 기반 단위 테스트 (56개)
+└── cli.py                   # typer: analyze / compare / train / serve
+tests/                       # 합성 이미지·랜드마크 기반 단위 테스트 (81개)
 ```
 
 ---
@@ -249,6 +264,8 @@ skin-metrics analyze <image> [--reference-bbox x,y,w,h] [--model PATH]
 skin-metrics compare <img1> <img2> [--reference-bbox ...] [--output ...]
 skin-metrics train [--data labels.csv | --dummy] [--mode regression|ranking]
                    [--epochs N] [--config ...]
+skin-metrics serve [--host 127.0.0.1] [--port 8000] [--reload] [--download-model]
+                   [--config cfg.yaml] [--allow-private-hosts]
 ```
 
 - `--download-model`: 첫 실행 시 FaceLandmarker 모델(~3.8MB) 자동 다운로드 후 캐시 재사용
@@ -256,14 +273,89 @@ skin-metrics train [--data labels.csv | --dummy] [--mode regression|ranking]
 
 ---
 
+## HTTP API
+
+`uv sync --extra api --extra detection` 후 `skin-metrics serve`. FastAPI/uvicorn은
+`api` extra에만 있으며, `skin_metrics.api` 를 import 하지 않는 한 코어 동작에 영향이 없습니다.
+OpenAPI 문서는 `/docs`, 스키마는 `/openapi.json`.
+
+### `POST /analyze`
+
+```jsonc
+// 요청
+{
+  "image_url": "https://example.com/face.jpg",   // 필수, http(s)
+  "reference_bbox": [10, 10, 40, 40]             // 선택, [x, y, w, h] 중립 패치
+}
+// 응답 200
+{
+  "report":  { /* SkinReport: CLI analyze 의 JSON 과 동일 (disclaimer 포함) */ },
+  "source":  { "url": ..., "final_url": ..., "content_type": "image/jpeg",
+               "bytes": 15222620, "width": 4912, "height": 7360 },
+  "elapsed_ms": 65987.25,
+  "version": "0.1.0"
+}
+```
+
+### `GET /healthz`
+
+`status` / `version` / `face_model_available`(모델 파일 존재) / `detection_available`
+(mediapipe import 가능) — 둘 다 `true` 여야 실제 분석이 가능합니다.
+
+### 오류 응답
+
+모든 4xx·5xx는 `{"error": {"code", "message"}}` 형식입니다.
+
+| status | code | 상황 |
+|---|---|---|
+| 400 | `invalid_scheme` / `invalid_url` / `dns_error` / `decode_error` / `empty_body` | URL·응답 본문 문제 |
+| 403 | `blocked_host` | URL이 사설/루프백/링크로컬 주소로 해석됨 |
+| 413 | `image_too_large` | 바이트 또는 픽셀 상한 초과 |
+| 422 | `invalid_request` / `analysis_failed` | 요청 검증 실패 / 얼굴 미검출·전 ROI 탈락 |
+| 502 | `upstream_error` / `fetch_error` / `too_many_redirects` | 이미지 호스트 실패 |
+| 503 | `face_model_missing` / `detection_unavailable` | 서버에 모델·mediapipe 없음 |
+| 504 | `fetch_timeout` | 다운로드 타임아웃 |
+
+### 보안 가드 (`api/fetch.py`)
+
+서버가 **사용자가 준 URL로 직접 요청**하므로 SSRF 경계입니다:
+scheme allow-list(http/https) → DNS 해석 결과가 사설·루프백·링크로컬·예약 대역이면 거부
+(`169.254.169.254` 같은 클라우드 메타데이터 포함) → 리다이렉트는 매 홉 재검증 + 횟수 제한 →
+본문은 스트리밍하며 바이트 상한에서 중단 → 디코딩 시 픽셀 수 상한(압축 폭탄 방어).
+남는 위험은 DNS rebinding(검증과 실제 연결이 각각 해석)이며, 이를 위협모델에 포함한다면
+egress 프록시에서 allow-list 하는 편이 낫습니다.
+
+### 환경변수
+
+| 변수 | 기본값 | 의미 |
+|---|---|---|
+| `SKIN_METRICS_API_CONFIG` | 패키지 기본 `config.yaml` | 설정 YAML 경로 |
+| `SKIN_METRICS_FACE_MODEL` | 캐시 경로 | FaceLandmarker `.task` 경로 |
+| `SKIN_METRICS_API_DOWNLOAD_MODEL` | `0` | 시작 시 모델 자동 다운로드 |
+| `SKIN_METRICS_API_MAX_BYTES` | `20971520` (20MB) | 다운로드 바이트 상한 |
+| `SKIN_METRICS_API_MAX_PIXELS` | `40000000` | 디코딩 픽셀 상한 |
+| `SKIN_METRICS_API_FETCH_TIMEOUT` | `10.0` | 다운로드 타임아웃(초) |
+| `SKIN_METRICS_API_MAX_REDIRECTS` | `3` | 리다이렉트 허용 횟수 |
+| `SKIN_METRICS_API_ALLOW_PRIVATE_HOSTS` | `0` | **개발 전용** — SSRF 가드 해제 |
+| `SKIN_METRICS_API_MAX_CONCURRENCY` | `2` | 동시 분석 수 (파이프라인은 CPU 바운드) |
+
+> **응답 시간**: 분석은 동기·CPU 바운드라 워커 스레드 + 세마포어로 실행됩니다.
+> 36MP(4912×7360) 사진 기준 **1건에 약 66초**가 걸리므로, 상한 픽셀을 낮추거나
+> 클라이언트에서 리사이즈해 올리는 것을 권장합니다(단, 리샘플링은 텍스처 기반 수분력
+> 프록시 값을 바꿉니다). 트래픽이 있다면 큐 + 작업 ID 방식으로 바꾸는 편이 좋습니다.
+
+---
+
 ## 테스트
 
 ```bash
-uv run pytest -q          # 56 passed
+uv run pytest -q          # 81 passed
 ```
 
 - **합성 이미지·합성 랜드마크** 기반이라 Phase 1 테스트는 `detection`/`dl` extra 없이 실행.
-- `tests/test_models.py`는 torch 미설치 시 `importorskip`으로 자동 스킵.
+- `tests/test_models.py`는 torch 미설치 시, `tests/test_api.py`는 fastapi 미설치 시
+  `importorskip`으로 자동 스킵.
+- API 테스트는 루프백 HTTP 서버를 띄워 실제 다운로드 경로까지 태우며 외부 네트워크는 쓰지 않음.
 - 커버리지: 색보정 왕복/CCM 복원/D65 화이트, ITA·멜라닌·홍반 공식·가드,
   헤모글로빈 ICA(정상/퇴화), 텍스처·주름 프록시, ROI 기하·마스킹, 정규화·스키마,
   end-to-end 파이프라인, Phase 2 forward/GRL/학습 루프(regression·ranking).
