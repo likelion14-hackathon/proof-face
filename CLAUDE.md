@@ -17,6 +17,13 @@
 - ✅ 실제 이미지 경로(MediaPipe **Tasks API**) 동작하도록 `detect_landmarks` 이중 API 지원.
 - ✅ **HTTP API 완료** (`skin_metrics/api/`, `api` extra) — `POST /analyze`(이미지 URL) /
   `GET /healthz`. 실제 사진으로 end-to-end 확인(36MP → 약 66초).
+- ✅ **Docker 완료** — `Dockerfile`(멀티스테이지, `api`/`full`) · `docker-compose.yml` ·
+  deny-all `.dockerignore`. 두 타깃 모두 arm64에서 검증:
+  `api`(1.72GB) 빌드→기동→`/analyze`, `full`(2.88GB) `train --dummy` 정상 완료.
+- ✅ **linux torch는 CPU 전용 인덱스** (`pyproject.toml`의 `[tool.uv.index] pytorch-cpu`).
+  macOS 로컬은 기존 PyPI 휠 그대로. 이미지 9.61GB → 2.88GB.
+- 🗑 `data/*.jpg`, `report.json`은 사용자 요청으로 **삭제됨**(gitignore 대상이라 복구 불가).
+  README/CLAUDE 예시는 `data/face.jpg` 같은 자리표시자 이름으로 바뀜.
 - ⏳ 미완/의도적 보류: `config.yaml` 레퍼런스 분포는 **placeholder**(재추정 필요),
   Phase 2는 **실측 라벨 CSV 부재로 절대값 무의미**(더미/ranking만 검증됨).
 
@@ -52,10 +59,15 @@
 ```bash
 uv run pytest -q                                   # 전체 테스트 (56)
 uv run pytest tests/test_models.py -q              # Phase 2만 (torch 필요)
-uv run skin-metrics analyze data/test2.jpg --download-model --output report.json
+uv run skin-metrics analyze data/face.jpg --download-model --output report.json
 uv run skin-metrics train --dummy --mode ranking --epochs 1
 uv run skin-metrics serve --download-model                # HTTP API (/docs)
 uv run pytest tests/test_api.py -q                        # API만 (fastapi 필요)
+
+./redeploy.sh                                             # down→build→up→헬스 대기
+docker build -t skin-metrics-api:0.1.0 .                  # 기본 = api 타깃 (torch 없음)
+docker build --target full -t skin-metrics-api:0.1.0-full .   # + Phase 2
+docker compose up --build                                 # 127.0.0.1:8000
 ```
 
 ## 아키텍처 지도 (수정 시 진입점)
@@ -119,6 +131,22 @@ Phase 2: `models.dataset(SkinDataset/DummyLabelGenerator)` → `models.network.S
   `tests/test_api.py`도 같이 확인.
 - **SSRF 가드 해제 플래그**(`--allow-private-hosts` / `SKIN_METRICS_API_ALLOW_PRIVATE_HOSTS`)는
   개발·테스트 전용. 배포 설정에 새지 않게 할 것.
+- **Docker: mediapipe가 비-headless opencv를 끌고 옴** → 런타임 이미지에 `libgl1`
+  `libglib2.0-0` `libxcb1` (+ sounddevice용 `libportaudio2`, `libgomp1`) 필요.
+  의존성 바뀌면 `ldd .venv/.../cv2/cv2.abi3.so | grep "not found"`로 재확인.
+- **Docker: `ghcr.io` 익명 pull이 이 환경에서 막힘** → uv를 PyPI에서 설치(Docker Hub만 사용).
+- **Docker: 모델 다운로드는 최종 스테이지에서** 실행해야 함. `detection/face.py`가 최상단에서
+  `cv2`를 import하므로 OS 라이브러리가 없는 builder 스테이지에서는 `ensure_face_model`조차
+  실패. 그래서 `api`/`full` 각각에 동일한 RUN이 한 줄씩 있음(의도된 중복).
+- **`.dockerignore`는 deny-all + allow-list**. 새 파일이 자동으로 이미지에 들어가지 않으므로,
+  런타임에 필요한 파일을 추가했다면 `!` 규칙을 직접 넣어야 함.
+- **linux torch는 반드시 CPU 인덱스**: PyPI 기본 휠은 nvidia-* CUDA를 끌고 와
+  `import torch`가 SIGILL(exit 132)로 죽음(`_preload_cuda_deps`). `pyproject.toml`의
+  `[[tool.uv.index]] pytorch-cpu` + `[tool.uv.sources]`(`sys_platform == 'linux'`)로 해결.
+- **`tool.uv.sources`는 직접 의존성에만 적용**. 그래서 `torchvision`을 `dl` extra에 명시함.
+  빼면 torch만 `+cpu`가 되어 `operator torchvision::nms does not exist` 발생.
+- **`dl` extra 버전을 건드리면** `uv lock` 후 **로컬(macOS)과 컨테이너(linux) 양쪽** 확인:
+  두 플랫폼이 서로 다른 인덱스에서 해석됨.
 
 ## 이어서 하면 좋은 작업 (Next steps)
 

@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from skin_metrics.api.app import create_app  # noqa: E402
 from skin_metrics.api.fetch import ImageFetchError, decode_image, validate_url  # noqa: E402
+from skin_metrics.api.schemas import AnalyzeRequest  # noqa: E402
 from skin_metrics.api.settings import ApiSettings  # noqa: E402
 
 
@@ -163,6 +164,19 @@ def test_healthz(client):
     body = resp.json()
     assert body["status"] == "ok"
     assert "의료기기가 아니" in body["disclaimer"]
+
+
+def test_openapi_example_is_a_request_that_would_succeed(client):
+    """The docs' "Try it out" body must be valid.
+
+    Pydantic would otherwise synthesise ``reference_bbox: [0, 0, 0, 0]`` from the
+    type, and that body is rejected by the validator (width/height must be > 0).
+    """
+    schema = client.get("/openapi.json").json()["components"]["schemas"]["AnalyzeRequest"]
+    example = schema["examples"][0]
+
+    assert "reference_bbox" not in example, "bbox is optional; keep it out of the example"
+    assert AnalyzeRequest.model_validate(example).reference_bbox is None
 
 
 def test_analyze_returns_report(client, image_server):

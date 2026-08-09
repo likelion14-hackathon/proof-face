@@ -18,6 +18,7 @@
 - [점수 해석 · 신뢰도 · 보정](#점수-해석--신뢰도--보정)
 - [CLI 레퍼런스](#cli-레퍼런스)
 - [HTTP API](#http-api)
+- [Docker](#docker)
 - [테스트](#테스트)
 - [알려진 한계 · TODO](#알려진-한계--todo)
 
@@ -40,16 +41,16 @@ uv sync --extra api --extra detection
 
 # 분석 (venv 활성화 시 uv 없이 skin-metrics 직접 실행 가능)
 # 첫 실행: --download-model 로 FaceLandmarker 모델(~3.8MB) 자동 다운로드
-skin-metrics analyze data/test2.jpg --download-model --output report.json
+skin-metrics analyze data/face.jpg --download-model --output report.json
 
 # 이후 실행: 모델 캐시 재사용 (플래그 불필요)
-skin-metrics analyze data/test2.jpg --output report.json
+skin-metrics analyze data/face.jpg --output report.json
 
 # 그레이카드/흰 종이가 프레임에 있으면 그 영역 지정 → 보정 신뢰도 상승
-skin-metrics analyze data/test2.jpg --reference-bbox 10,10,40,40 --output report.json
+skin-metrics analyze data/face.jpg --reference-bbox 10,10,40,40 --output report.json
 
 # 두 시점 비교 (같은 사람·같은 조건 촬영 권장)
-skin-metrics compare data/test-image.jpg data/test2.jpg
+skin-metrics compare data/before.jpg data/after.jpg
 
 # Phase 2 딥러닝 스캐폴드 (라벨 없이 더미로 학습 루프 검증)
 skin-metrics train --dummy --mode ranking --epochs 3
@@ -105,6 +106,9 @@ skin_metrics/
 ├── config.py / config.yaml  # 설정 로더 / 임계값·레퍼런스 분포
 └── cli.py                   # typer: analyze / compare / train / serve
 tests/                       # 합성 이미지·랜드마크 기반 단위 테스트 (81개)
+Dockerfile                   # 멀티스테이지: api(기본) / full(Phase 2 포함)
+docker-compose.yml           # 로컬 실행 + trainer 프로파일
+.dockerignore                # deny-all + allow-list (로컬 사진·리포트 유출 차단)
 ```
 
 ---
@@ -343,6 +347,109 @@ egress 프록시에서 allow-list 하는 편이 낫습니다.
 > 36MP(4912×7360) 사진 기준 **1건에 약 66초**가 걸리므로, 상한 픽셀을 낮추거나
 > 클라이언트에서 리사이즈해 올리는 것을 권장합니다(단, 리샘플링은 텍스처 기반 수분력
 > 프록시 값을 바꿉니다). 트래픽이 있다면 큐 + 작업 ID 방식으로 바꾸는 편이 좋습니다.
+
+---
+
+## Docker
+
+```bash
+docker build -t skin-metrics-api:0.1.0 .        # 기본 = api 타깃 (약 1.7GB)
+docker run --rm -p 127.0.0.1:8000:8000 skin-metrics-api:0.1.0
+curl localhost:8000/healthz
+```
+
+**재배포 스크립트** — 이전 스택 종료 → 빌드 → 재기동 → 헬스체크 통과까지 한 번에:
+
+```bash
+./redeploy.sh                          # 코드 고친 뒤 이거 하나면 끝
+./redeploy.sh --no-cache               # 의존성까지 처음부터 다시 (약 5분)
+./redeploy.sh --logs                   # 뜨고 나서 로그 따라가기
+SKIN_METRICS_PORT=8100 ./redeploy.sh   # 8000이 이미 쓰이는 경우
+```
+
+포트를 이미 쓰는 프로세스가 있으면 **죽이지 않고 누가 쓰는지 알려주고 멈춥니다**.
+이미지 정리도 `skin-metrics-api` 라벨이 붙은 것만 대상으로 해서, 다른 프로젝트의 컨테이너·
+이미지·빌드 캐시는 건드리지 않습니다.
+
+compose를 직접 쓸 때:
+
+```bash
+docker compose up -d --build      # 빌드 + 백그라운드 실행 (코드 수정 후엔 항상 --build)
+docker compose up -d              # 이미지가 이미 있으면 빌드 없이 실행만
+docker compose logs -f api
+docker compose down
+
+SKIN_METRICS_PORT=8100 docker compose up -d   # 8000 포트가 이미 쓰이는 경우
+```
+
+> **`up -d`는 이미지가 없을 때만 빌드합니다.** 이미 `skin-metrics-api:0.1.0`이 있으면
+> 소스를 고쳐도 예전 이미지를 그대로 띄웁니다. 코드 변경을 반영하려면 `--build`를 붙이세요.
+> `trainer` 서비스는 `full` 프로파일이라 `up`으로는 뜨지 않습니다.
+
+FaceLandmarker 모델(~3.8MB)이 **빌드 시점에 이미지 안에 포함**되므로 컨테이너는 시작할 때
+네트워크가 필요 없습니다(빌드에는 필요). 밖으로 나가는 통신은 `/analyze`의 이미지 URL
+다운로드뿐입니다.
+
+### 빌드 타깃 2종
+
+| 타깃 | 내용 | 크기 | 용도 |
+|---|---|---|---|
+| `api` (기본) | Phase 1 + FastAPI. torch 없음 | 1.72GB | 배포용 |
+| `full` | 위 + `dl` extra(torch/torchvision/timm/albumentations/pandas) | 2.88GB | 컨테이너에서도 Phase 2 학습 |
+
+```bash
+docker build --target full -t skin-metrics-api:0.1.0-full .
+docker run --rm skin-metrics-api:0.1.0-full skin-metrics train --dummy --mode ranking --epochs 1
+# compose 로도 동일:
+docker compose --profile full run --rm trainer train --dummy --mode ranking
+```
+
+두 타깃은 소스와 OS 레이어를 공유하고 **가상환경만 다릅니다**. 배포 이미지에 torch가 들어가지
+않도록 기본 타깃을 `api`로 두었고, Phase 2가 필요하면 `full`을 쓰면 로컬과 동일하게 동작합니다.
+
+**linux에서는 torch/torchvision을 CPU 전용 인덱스**(`https://download.pytorch.org/whl/cpu`)에서
+받도록 `pyproject.toml`에 설정돼 있습니다. PyPI 기본 휠은 nvidia-* CUDA 패키지를 끌고 오는데,
+GPU 없는 컨테이너에서 `import torch` 가 **SIGILL로 죽습니다**(`torch._preload_cuda_deps`).
+macOS 로컬은 영향 없이 기존 휠을 그대로 씁니다. 이 설정으로 이미지가 9.61GB → 2.88GB가 됐습니다.
+
+> `torchvision`이 `dl` extra에 명시돼 있는 이유: `[tool.uv.sources]`는 **직접 의존성에만**
+> 적용됩니다. timm의 전이 의존성으로 두면 torch만 `+cpu`가 되어 ABI가 어긋나고
+> `operator torchvision::nms does not exist` 로 학습이 실패합니다.
+
+> 빌드에는 디스크 여유가 넉넉해야 합니다(**15GB 이상 권장**). 부족하면 빌드가 멈추면서 도커
+> 데몬까지 응답하지 않을 수 있습니다(그 경우 Docker Desktop 재시작).
+
+### 이미지 올리기 (레지스트리 push)
+
+```bash
+# 단일 아키텍처
+docker build -t <registry>/<user>/skin-metrics-api:0.1.0 .
+docker push <registry>/<user>/skin-metrics-api:0.1.0
+
+# amd64 + arm64 동시 (mediapipe 1.0.0 은 manylinux x86_64·aarch64 휠 모두 제공)
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t <registry>/<user>/skin-metrics-api:0.1.0 --push .
+```
+
+`ghcr.io/astral-sh/uv` 이미지를 쓰지 않고 **PyPI의 uv를 설치**하도록 되어 있어, 빌드는
+Docker Hub만 있으면 됩니다(일부 네트워크에서 ghcr 익명 pull이 막힙니다).
+
+### 이미지에 들어가는 것 / 안 들어가는 것
+
+`.dockerignore`가 **전부 차단 후 필요한 것만 허용**하는 방식이라, 빌드 컨텍스트에는
+`pyproject.toml` · `uv.lock` · `README.md` · `skin_metrics/` 만 들어갑니다.
+`data/`의 얼굴 사진, `report*.json`, `tests/`, `.venv/`, `.git/`, `*.task`는 **어떤 경로로도
+이미지에 포함되지 않습니다**. 나중에 새 파일이 생겨도 기본이 차단이라 안전합니다.
+
+### 운영 시 확인할 것
+
+- `docker-compose.yml`은 **127.0.0.1 에만 바인딩**합니다. `/analyze` 앞에 인증·레이트리밋이
+  없으므로, 외부에 열려면 리버스 프록시에서 인증·요청 제한을 반드시 두세요.
+- `SKIN_METRICS_API_ALLOW_PRIVATE_HOSTS=1`은 **개발 전용**입니다. 켜면 컨테이너가
+  같은 네트워크의 내부 서비스로 요청을 보낼 수 있게 됩니다(SSRF).
+- 분석은 CPU 바운드입니다. `SKIN_METRICS_API_MAX_CONCURRENCY`와 컨테이너 CPU 한도를
+  같이 올리세요(compose 기본: 2 CPU / 동시 2건).
+- 컨테이너는 비루트(uid 10001)로 실행되며 compose에서 `read_only: true` 로 뜹니다.
 
 ---
 

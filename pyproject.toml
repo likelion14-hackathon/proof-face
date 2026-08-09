@@ -24,6 +24,11 @@ detection = [
 ]
 dl = [
     "torch>=2.2",
+    # Pulled in by timm anyway; listed explicitly so the [tool.uv.sources] CPU
+    # index below applies to it (sources only bind direct dependencies). A
+    # PyPI torchvision against a +cpu torch fails with "operator
+    # torchvision::nms does not exist" - the compiled extensions must match.
+    "torchvision>=0.17",
     "timm>=0.9.16",
     "albumentations>=1.4",
     "pandas>=2.1",
@@ -40,6 +45,20 @@ dev = [
 
 [project.scripts]
 skin-metrics = "skin_metrics.cli:app"
+
+# On Linux the default PyPI torch/torchvision wheels drag in the nvidia-* CUDA
+# packages, and importing torch then dies with SIGILL in a GPU-less container
+# (torch._preload_cuda_deps). Containers here are CPU-only, so Linux resolves
+# torch from PyTorch's CPU index instead; macOS keeps the PyPI wheel, which is
+# already CPU-only. Same pinned versions (2.13.0 / 0.28.0), ~7GB smaller image.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
 
 [build-system]
 requires = ["hatchling"]

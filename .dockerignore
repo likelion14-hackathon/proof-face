@@ -1,0 +1,15 @@
+# Deny everything, then allow only what the image actually needs.
+# This ordering guarantees that face photos, reports, checkpoints and other
+# local data can never leak into the build context (and therefore the image),
+# even if new files appear in the repo later.
+*
+
+!pyproject.toml
+!uv.lock
+!README.md
+!skin_metrics/
+
+# ...minus build cruft inside the allowed source tree.
+skin_metrics/**/__pycache__/
+skin_metrics/**/*.py[cod]
+skin_metrics/**/*.task

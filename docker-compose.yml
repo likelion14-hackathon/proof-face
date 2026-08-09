@@ -1,0 +1,49 @@
+# Local run / single-host deployment.
+#   docker compose up --build          # http://127.0.0.1:8000/docs
+#
+# Phase 2 (training) instead of the lean API image:
+#   docker compose --profile full run --rm trainer train --dummy --mode ranking
+
+services:
+  api:
+    build:
+      context: .
+      target: api
+    image: skin-metrics-api:0.1.0
+    # Bound to loopback: there is no auth or rate limiting in front of /analyze.
+    # Override the host port when 8000 is taken: SKIN_METRICS_PORT=8100 docker compose up -d
+    ports:
+      - "127.0.0.1:${SKIN_METRICS_PORT:-8000}:8000"
+    environment:
+      # See README "HTTP API" for the full list of knobs.
+      SKIN_METRICS_API_MAX_CONCURRENCY: "2"
+      SKIN_METRICS_API_MAX_PIXELS: "40000000"
+      SKIN_METRICS_API_MAX_BYTES: "20971520"
+      SKIN_METRICS_API_FETCH_TIMEOUT: "10.0"
+      # SSRF guard. Leave off in any shared/production environment.
+      SKIN_METRICS_API_ALLOW_PRIVATE_HOSTS: "0"
+      # matplotlib (a mediapipe dependency) wants a writable config dir; $HOME
+      # is read-only here, so point it at the tmpfs below.
+      MPLCONFIGDIR: /tmp/mpl
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          # Analysis is CPU-bound; raise together with MAX_CONCURRENCY.
+          cpus: "2.0"
+          memory: 4g
+
+  # Phase 2 image (adds torch/timm). Not started by `docker compose up`.
+  trainer:
+    profiles: ["full"]
+    build:
+      context: .
+      target: full
+    image: skin-metrics-api:0.1.0-full
+    entrypoint: ["skin-metrics"]
+    command: ["train", "--dummy", "--mode", "ranking", "--epochs", "1"]
