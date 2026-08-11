@@ -815,8 +815,8 @@ Docker Hub만 있으면 됩니다(일부 네트워크에서 ghcr 익명 pull이 
 ### AWS EC2 배포
 
 ⚠️ **아키텍처 주의**: 맥에서 `docker build`로 만든 기본 이미지는 arm64라서 x86_64 EC2에
-올리면 `exec format error`로 죽습니다. 반드시 **`--platform linux/amd64`로 크로스 빌드**한
-이미지(방법 A)를 올리거나, **인스턴스 위에서 빌드**(방법 B)하세요.
+올리면 `exec format error`로 죽습니다. GitHub Actions가 amd64로 빌드해 주므로
+**방법 A(ghcr pull)를 쓰면 이 문제가 없습니다.**
 
 #### 1. 인스턴스 선택
 
@@ -848,24 +848,34 @@ docker compose version
 
 > Ubuntu면 `sudo apt install -y docker.io docker-compose-v2 git` 로 대체.
 
-#### 3-A. 배포 — 이미지 파일 업로드 (권장, 해커톤)
+#### 3-A. 배포 — GitHub Packages에서 pull (권장)
 
-빌드 없이 **이미지 파일 하나만 올리면** 됩니다. 로컬에서 amd64 이미지를 만들어 저장:
+이미지는 **GitHub Actions가 빌드해 ghcr.io에 올립니다**
+(`.github/workflows/publish-image.yml`). `main`에 푸시하면 자동으로 돌고,
+Actions 탭에서 "Publish image" → *Run workflow* 로 수동 실행도 됩니다.
+러너가 amd64 네이티브라 맥에서 크로스 빌드하는 것보다 훨씬 빠릅니다.
 
-```bash
-# 맥에서 (Apple Silicon이어도 amd64로 크로스 빌드됨)
-docker buildx build --platform linux/amd64 --target api \
-  -t skin-metrics-api:0.1.0-amd64 --load .
-docker save skin-metrics-api:0.1.0-amd64 | gzip > skin-metrics-api-0.1.0-amd64.tar.gz
+```
+ghcr.io/likelion14-hackathon/skin-metrics-api:latest
+ghcr.io/likelion14-hackathon/skin-metrics-api:<commit-sha>   # 롤백용
 ```
 
-EC2로 올리고 실행:
+**저장소가 private이면 패키지도 private**이므로 EC2에서 먼저 로그인해야 합니다.
+`read:packages` 스코프 PAT을 [github.com/settings/tokens](https://github.com/settings/tokens)에서
+만들어(classic, `read:packages`만 체크):
 
 ```bash
-scp -i key.pem skin-metrics-api-0.1.0-amd64.tar.gz ec2-user@<EC2-IP>:~/
-ssh -i key.pem ec2-user@<EC2-IP>
+echo '<PAT>' | docker login ghcr.io -u <github-사용자명> --password-stdin
+```
 
-docker load < skin-metrics-api-0.1.0-amd64.tar.gz
+> 패키지를 **public**으로 바꾸면(패키지 페이지 → Package settings → Change visibility)
+> EC2에서 로그인 없이 pull할 수 있습니다. 다만 이미지 안에 소스 코드가 들어 있으므로
+> 저장소를 private으로 두는 이유가 있다면 위의 PAT 방식을 쓰세요.
+
+EC2에서 실행:
+
+```bash
+docker pull ghcr.io/likelion14-hackathon/skin-metrics-api:latest
 docker run -d --name skin-metrics --restart unless-stopped \
   -p 0.0.0.0:8000:8000 \
   -e SKIN_METRICS_REDIS_URL='redis://default:<password>@<redis-host>:<port>/0' \
@@ -873,8 +883,18 @@ docker run -d --name skin-metrics --restart unless-stopped \
   -e MPLCONFIGDIR=/tmp/mpl \
   --read-only --tmpfs /tmp:rw,size=64m \
   --memory 4g --cpus 2 \
-  skin-metrics-api:0.1.0-amd64
+  ghcr.io/likelion14-hackathon/skin-metrics-api:latest
 ```
+
+> Spring Boot가 **같은 인스턴스**에서 돌아 localhost로만 부른다면
+> `-p 127.0.0.1:8000:8000`으로 바꾸세요. 외부에 전혀 노출되지 않아 인증이 없는
+> 현재 상태에서 가장 안전합니다.
+
+업데이트는 `docker pull ... && docker rm -f skin-metrics && docker run ...` 입니다.
+
+> **Graviton(t4g/c7g)에 배포한다면** 기본 워크플로는 amd64만 만듭니다.
+> Actions에서 *Run workflow* 시 platforms 입력을 `linux/amd64,linux/arm64`로 주세요
+> (arm64는 러너에서 에뮬레이션되어 빌드가 몇 배 느립니다).
 
 #### 3-B. 배포 — 저장소 클론 + 인스턴스에서 빌드
 

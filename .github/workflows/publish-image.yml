@@ -1,0 +1,83 @@
+# Build the API image and publish it to GitHub Packages (ghcr.io).
+#
+# Runs on the GitHub runner, so no local Docker credentials are involved: the
+# automatic GITHUB_TOKEN already carries `packages: write` for this repo's org.
+# The runner is amd64, which is what a standard EC2 instance needs, and it
+# builds natively -- cross-building amd64 on an Apple Silicon mac goes through
+# QEMU and takes several times longer.
+#
+# Pull the result on EC2 with:
+#   docker pull ghcr.io/likelion14-hackathon/skin-metrics-api:latest
+# The package inherits the repository's visibility, so while the repo is
+# private the EC2 host must `docker login ghcr.io` with a read:packages token.
+
+name: Publish image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "skin_metrics/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/publish-image.yml"
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Target platforms (add linux/arm64 for Graviton/t4g)"
+        default: "linux/amd64"
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/skin-metrics-api
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Only needed when a non-native platform is requested; harmless otherwise.
+      - name: Set up QEMU
+        if: contains(github.event.inputs.platforms, 'arm64')
+        uses: docker/setup-qemu-action@v3
+
+      - name: Log in to GitHub Packages
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: api
+          platforms: ${{ github.event.inputs.platforms || 'linux/amd64' }}
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          # Layer cache lives in the Actions cache, so a rebuild that only
+          # touches skin_metrics/ skips the (slow) dependency install.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published"
+            echo ""
+            echo '```'
+            echo "docker pull ${IMAGE}:latest"
+            echo "docker pull ${IMAGE}:${GITHUB_SHA}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

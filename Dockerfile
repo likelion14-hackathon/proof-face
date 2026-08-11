@@ -63,7 +63,9 @@ FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime-base
 
 # Lets redeploy.sh clean up *only* this project's leftover images.
 LABEL org.opencontainers.image.title="skin-metrics-api"
-LABEL org.opencontainers.image.source="https://github.com/-/skin-metrics"
+# This label is what links the GitHub Packages entry back to the repository
+# (and makes the package inherit the repo's access settings).
+LABEL org.opencontainers.image.source="https://github.com/likelion14-hackathon/proof-face"
 
 # mediapipe depends on opencv-contrib-python (not the headless build), whose
 # cv2 shared object links libGL / glib / libxcb at import time; sounddevice

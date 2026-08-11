@@ -31,9 +31,19 @@ Spring Boot 백엔드와의 연동을 위해 API가 **비동기**로 바뀌었�
    `error.code`로 전달 — HTTP로는 안 나감.
 5. **Redis 자격증명은 `.env`**(gitignore됨)에만. compose가 `${SKIN_METRICS_REDIS_URL:-}`로
    주입. **저장소에 커밋 금지.** 해커톤 Redis Cloud 인스턴스는 사용자가 보유.
-6. **amd64 이미지**: `docker buildx build --platform linux/amd64 --target api ... --load`
-   → `docker save | gzip` → `skin-metrics-api-0.1.0-amd64.tar.gz`(419MB, gitignore됨).
-   에뮬레이션 기동 + Redis 연결 스모크 통과. EC2 배포 절차는 README "AWS EC2 배포".
+6. **이미지 배포는 GitHub Packages** (`.github/workflows/publish-image.yml`).
+   `main` 푸시 시 러너(amd64 네이티브)가 빌드해
+   `ghcr.io/likelion14-hackathon/skin-metrics-api:{latest,<sha>}`로 push.
+   `GITHUB_TOKEN`의 `packages: write`를 쓰므로 **로컬 자격증명 불필요**.
+   ⚠️ 로컬에서 `docker buildx --push`로 직접 올리려다 `denied`로 실패했음 —
+   `gh` 토큰에 `write:packages`가 없고 docker에 저장된 ghcr 자격증명이 다른 계정
+   (`likelionknu`) 것이었기 때문. 로컬 푸시가 필요하면
+   `gh auth refresh -h github.com -s write:packages` 후 재로그인.
+   저장소가 private → **패키지도 private**이라 EC2에서 `read:packages` PAT으로
+   `docker login ghcr.io` 필요(또는 패키지를 public 전환). 배포 절차는
+   README "AWS EC2 배포".
+   Graviton 배포 시에만 workflow_dispatch의 platforms에 `linux/arm64` 추가
+   (러너에서 에뮬레이션되어 느림).
 
 검증: 실 Redis Cloud로 E2E(제출→202→백그라운드 분석→Redis 문서 확인, TTL 3600s),
 컨테이너 `/healthz` `result_store: "redis"`, 테스트 137개 통과(메모리 스토어로 폴링).
