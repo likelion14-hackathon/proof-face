@@ -27,10 +27,10 @@ services:
       SKIN_METRICS_API_ANALYSIS_MAX_PIXELS: "16000000"
       SKIN_METRICS_API_MAX_BYTES: "20971520"
       SKIN_METRICS_API_FETCH_TIMEOUT: "10.0"
-      # Async result hand-off. The URL carries credentials, so it lives in the
-      # (gitignored) .env file next to this compose file -- see README.
-      # Unset -> in-process memory store; /healthz then reports "memory".
-      SKIN_METRICS_REDIS_URL: "${SKIN_METRICS_REDIS_URL:-}"
+      # Async result hand-off; required. The URL carries credentials, so it
+      # lives in the (gitignored) .env file next to this compose file -- see
+      # README. `:?` makes a missing one fail here rather than at startup.
+      SKIN_METRICS_REDIS_URL: "${SKIN_METRICS_REDIS_URL:?set SKIN_METRICS_REDIS_URL in .env}"
       SKIN_METRICS_RESULT_TTL: "${SKIN_METRICS_RESULT_TTL:-3600}"
       # SSRF guard. Leave off in any shared/production environment.
       SKIN_METRICS_API_ALLOW_PRIVATE_HOSTS: "0"

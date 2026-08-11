@@ -43,7 +43,7 @@ from .. import DISCLAIMER, __version__
 from ..config import load_config
 from ..pipeline import analyze as run_analyze
 from .fetch import ImageFetchError, fetch_image, validate_url
-from .results import make_store
+from .results import ResultStore
 from .schemas import (
     AcceptedResponse,
     AnalyzeRequest,
@@ -114,6 +114,13 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
         """Load config, resolve the face model, connect the result store."""
         from ..detection.face import ensure_face_model, resolve_face_model
 
+        # Checked first, before any slow startup work: results are handed off
+        # through Redis, so without it the API has nowhere to put them.
+        if not cfg.redis_url:
+            raise RuntimeError(
+                "SKIN_METRICS_REDIS_URL is not set. Analysis results are handed "
+                "off through Redis, so the API cannot start without it."
+            )
         app.state.config = load_config(cfg.config_path)
         model_path = cfg.face_model_path
         if cfg.download_model:
@@ -123,7 +130,7 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
             model_path = str(resolved) if resolved is not None else None
         app.state.face_model_path = model_path
         app.state.limiter = anyio.Semaphore(cfg.max_concurrency)
-        app.state.results = make_store(cfg.redis_url, cfg.result_ttl)
+        app.state.results = ResultStore(cfg.redis_url, cfg.result_ttl)
         # Strong references to in-flight background tasks: asyncio only keeps
         # weak ones, so an unreferenced task can be garbage-collected mid-run.
         app.state.tasks = set()
@@ -249,16 +256,12 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
 
     @app.get("/healthz", response_model=HealthResponse, tags=["meta"])
     async def healthz(request: Request) -> HealthResponse:
-        """Report liveness, detection readiness, and the result-store state."""
-        store = request.app.state.results
-        if store.backend == "redis":
-            store_status = "redis" if await store.ping() else "redis_unreachable"
-        else:
-            store_status = "memory"
+        """Report liveness, detection readiness, and Redis reachability."""
+        reachable = await request.app.state.results.ping()
         return HealthResponse(
             face_model_available=request.app.state.face_model_path is not None,
             detection_available=_detection_available(),
-            result_store=store_status,
+            result_store="redis" if reachable else "redis_unreachable",
         )
 
     @app.post(

@@ -23,13 +23,15 @@ Spring Boot 백엔드와의 연동을 위해 API가 **비동기**로 바뀌었�
    (`processing`/`done`/`failed`)는 `api/results.py` docstring 참조.
    `GET /results/{key}`는 디버깅용 미러.
 2. **`/analyze/simple` → `/analyze/diary` 리네임** (스키마 `DiaryAnalyzeResponse`).
-3. **스토어 이원화** (`api/results.py`): `SKIN_METRICS_REDIS_URL` 설정 시
-   `RedisResultStore`, 미설정 시 `MemoryResultStore`(테스트·로컬 전용 — 다른 프로세스에서
-   안 보임). `/healthz`의 `result_store`(`redis`/`redis_unreachable`/`memory`)로 구분.
+3. **Redis 필수** (`api/results.py`의 `ResultStore` 하나뿐): `SKIN_METRICS_REDIS_URL`
+   미설정이면 lifespan에서 `RuntimeError`로 기동 실패. 메모리 폴백은 **제거**했습니다 —
+   `.env`를 빠뜨렸을 때 API는 정상인데 Spring만 결과를 못 읽는 조용한 실패가 났었기 때문.
+   compose도 `${SKIN_METRICS_REDIS_URL:?...}`로 먼저 막습니다.
+   `/healthz`의 `result_store`는 `redis`/`redis_unreachable` 둘 뿐.
 4. **오류 모델 변화**: 제출 시점에 아는 것만 동기 4xx(잘못된 URL, blocked_host, 검증
    실패, 스토어 다운 503). 다운로드·분석 실패는 저장 문서의 `status: "failed"` +
    `error.code`로 전달 — HTTP로는 안 나감.
-5. **Redis 자격증명은 `.env`**(gitignore됨)에만. compose가 `${SKIN_METRICS_REDIS_URL:-}`로
+5. **Redis 자격증명은 `.env`**(gitignore됨)에만. compose가 `${SKIN_METRICS_REDIS_URL:?}`로
    주입. **저장소에 커밋 금지.** 해커톤 Redis Cloud 인스턴스는 사용자가 보유.
 6. **이미지 배포는 GitHub Packages** (`.github/workflows/publish-image.yml`).
    `main` 푸시 시 러너(amd64 네이티브)가 빌드해
@@ -46,7 +48,7 @@ Spring Boot 백엔드와의 연동을 위해 API가 **비동기**로 바뀌었�
    (러너에서 에뮬레이션되어 느림).
 
 검증: 실 Redis Cloud로 E2E(제출→202→백그라운드 분석→Redis 문서 확인, TTL 3600s),
-컨테이너 `/healthz` `result_store: "redis"`, 테스트 137개 통과(메모리 스토어로 폴링).
+컨테이너 `/healthz` `result_store: "redis"`, 테스트 138개 통과(가짜 Redis 클라이언트로 폴링).
 
 ### 이전 라운드 (특징 부분집합 탐색 + 0~10 점수 API)
 
@@ -182,7 +184,7 @@ Corneometer·전문가 등급 실측)로 보정하면서 **정확도 관련 실�
 
 ### 기존 상태
 
-- ✅ **Phase 1 완료** — 전 모듈 구현, 단위 테스트 **137개 통과**(API·보정 툴링 포함).
+- ✅ **Phase 1 완료** — 전 모듈 구현, 단위 테스트 **138개 통과**(API·보정 툴링 포함).
 - ✅ **Phase 2 스캐폴드 완료** — dataset(+더미)/network/train, 더미로 학습 루프 end-to-end 확인.
 - ✅ 실제 이미지 경로(MediaPipe **Tasks API**) 동작하도록 `detect_landmarks` 이중 API 지원.
 - ✅ **HTTP API 완료** (`skin_metrics/api/`, `api` extra) — 비동기 `POST /analyze`(0~100) /
@@ -298,7 +300,7 @@ api.app.create_app(settings) → FastAPI          # 모듈 최상단 app = creat
 │     analyze = 0~100 AnalyzeResponse, diary = 0~10 DiaryAnalyzeResponse
 │     전체 SkinReport는 CLI 전용
 └─ GET  /results/{key}  → 저장 문서 미러 (디버깅용; Spring은 Redis 직접 읽음)
-api.results.make_store → RedisResultStore | MemoryResultStore (URL 미설정 시)
+api.results.ResultStore  # Redis 전용. _connect()만 분리 → 테스트가 클라이언트만 대체
 api.settings.ApiSettings.from_env()  # SKIN_METRICS_API_* (한도·타임아웃·동시성)
 ```
 
@@ -367,7 +369,7 @@ Phase 2: `models.dataset(SkinDataset/DummyLabelGenerator)` → `models.network.S
   신뢰도 표현이 필요하면 `confidence`를 쓰세요.
 - **`results.finish/fail`은 기존 문서의 `submitted_at`을 보존**(get 후 merge). 새로
   `_processing()`을 만들어 덮으면 제출 시각이 완료 시각으로 바뀝니다(실제로 그랬음).
-- **Redis 자격증명은 `.env` 전용** — compose가 `${SKIN_METRICS_REDIS_URL:-}`로 주입.
+- **Redis 자격증명은 `.env` 전용** — compose가 `${SKIN_METRICS_REDIS_URL:?}`로 주입(미설정 시 즉시 실패).
   코드·compose·README 어디에도 실제 URL을 적지 말 것(공개 저장소).
 - **절대 색상 특징은 기기 간 전이 안 됨**. `melanin_index`/`ita`를 composite에 다시
   넣으려면 그레이카드/컬러체커 보정(`--reference-bbox`)이 전제되어야 합니다.

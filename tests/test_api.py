@@ -81,15 +81,49 @@ def image_server(synthetic_image):
         thread.join(timeout=5)
 
 
+class _FakeRedis:
+    """The four calls :class:`ResultStore` makes, backed by a dict.
+
+    Only the transport is faked; the document logic (key naming, the
+    ``submitted_at`` merge, JSON encoding) stays under test.
+    """
+
+    def __init__(self) -> None:
+        self._data: dict[str, str] = {}
+
+    async def ping(self) -> bool:
+        return True
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
+        self._data[key] = value
+
+    async def get(self, key: str) -> str | None:
+        return self._data.get(key)
+
+    async def aclose(self) -> None:
+        self._data.clear()
+
+
+@pytest.fixture(autouse=True)
+def fake_redis(monkeypatch):
+    """Redis is mandatory and there is none here: swap the connection only."""
+    monkeypatch.setattr("skin_metrics.api.results._connect", lambda url: _FakeRedis())
+
+
+def _settings(**overrides) -> ApiSettings:
+    """Test settings: SSRF guard off, plus a URL the fake connection answers."""
+    base = {"allow_private_hosts": True, "redis_url": "redis://fake:6379/0"}
+    return ApiSettings(**(base | overrides))
+
+
 @pytest.fixture
 def client(monkeypatch, synthetic_landmarks):
-    """TestClient with loopback URLs allowed and landmark detection stubbed."""
+    """TestClient with loopback URLs allowed, detection and Redis stubbed."""
     monkeypatch.setattr(
         "skin_metrics.pipeline.detect_landmarks",
         lambda img, model_path=None: synthetic_landmarks,
     )
-    settings = ApiSettings(allow_private_hosts=True, max_concurrency=1)
-    with TestClient(create_app(settings)) as test_client:
+    with TestClient(create_app(_settings(max_concurrency=1))) as test_client:
         yield test_client
 
 
@@ -176,8 +210,7 @@ def test_analyze_downscales_instead_of_rejecting_a_big_image(
         "skin_metrics.pipeline.detect_landmarks",
         lambda img, model_path=None: synthetic_landmarks,
     )
-    settings = ApiSettings(allow_private_hosts=True, analysis_max_pixels=40_000)
-    with TestClient(create_app(settings)) as budgeted:
+    with TestClient(create_app(_settings(analysis_max_pixels=40_000))) as budgeted:
         result = _analyze_result(
             budgeted, "/analyze", {"image_url": f"{image_server}/face.png"}
         )
@@ -234,8 +267,15 @@ def test_healthz(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
-    assert body["result_store"] == "memory"  # tests run without SKIN_METRICS_REDIS_URL
+    assert body["result_store"] == "redis"
     assert "의료기기가 아니" in body["disclaimer"]
+
+
+def test_startup_fails_without_a_redis_url():
+    """Redis is the hand-off, so a missing URL must be loud, not a silent fallback."""
+    with pytest.raises(RuntimeError, match="SKIN_METRICS_REDIS_URL"):
+        with TestClient(create_app(ApiSettings(redis_url=""))):
+            pass
 
 
 def test_openapi_example_is_a_request_that_would_succeed(client):
@@ -390,8 +430,7 @@ def test_byte_limit_fails_the_stored_result(monkeypatch, synthetic_landmarks, im
         "skin_metrics.pipeline.detect_landmarks",
         lambda img, model_path=None: synthetic_landmarks,
     )
-    settings = ApiSettings(allow_private_hosts=True, max_bytes=128)
-    with TestClient(create_app(settings)) as small:
+    with TestClient(create_app(_settings(max_bytes=128))) as small:
         error = _failed_doc(small, "/analyze", {"image_url": f"{image_server}/face.png"})
     assert error["code"] == "image_too_large"
 
@@ -400,7 +439,7 @@ def test_missing_face_fails_the_stored_result(monkeypatch, image_server):
     monkeypatch.setattr(
         "skin_metrics.pipeline.detect_landmarks", lambda img, model_path=None: None
     )
-    with TestClient(create_app(ApiSettings(allow_private_hosts=True))) as faceless:
+    with TestClient(create_app(_settings())) as faceless:
         error = _failed_doc(faceless, "/analyze/diary", {"image_url": f"{image_server}/face.png"})
     assert error["code"] == "analysis_failed"
 
@@ -409,7 +448,7 @@ def test_missing_face_fails_the_stored_result(monkeypatch, image_server):
 
 
 def test_analyze_blocks_private_host_by_default(image_server):
-    with TestClient(create_app(ApiSettings())) as guarded:
+    with TestClient(create_app(_settings(allow_private_hosts=False))) as guarded:
         resp = guarded.post("/analyze", json={"image_url": f"{image_server}/face.png"})
     assert resp.status_code == 403
     assert resp.json()["error"]["code"] == "blocked_host"

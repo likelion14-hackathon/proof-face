@@ -224,11 +224,9 @@ class HealthResponse(BaseModel):
     )
     detection_available: bool = Field(description="Whether the 'detection' extra is importable.")
     result_store: str = Field(
-        default="memory",
         description=(
-            "'redis' (connected), 'redis_unreachable' (configured but down), or "
-            "'memory' (SKIN_METRICS_REDIS_URL not set -- results invisible to "
-            "other services)."
+            "'redis' (answering) or 'redis_unreachable' (down -- submissions "
+            "will be refused with 503 until it comes back)."
         ),
     )
     disclaimer: str = DISCLAIMER

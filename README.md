@@ -583,8 +583,10 @@ Spring Boot ────────────── GET {request_id}:analyze 
 
 Redis 연결은 `SKIN_METRICS_REDIS_URL`(`redis://user:password@host:port/db`)로 설정하며,
 **자격증명이 들어가므로 저장소에 커밋하지 않고** compose 옆의 `.env`(gitignore됨)에 둡니다.
-URL을 설정하지 않으면 프로세스 내부 메모리 스토어로 폴백합니다(개발·테스트 전용 —
-다른 서비스에서는 결과가 보이지 않으며, `/healthz`의 `result_store`가 `"memory"`로 표시됨).
+Redis는 캐시가 아니라 **결과 전달 경로 자체이므로 필수**입니다. 미설정 시 API는 기동 단계에서
+`RuntimeError`로 즉시 실패하고(`docker compose`는 그 전에 변수 미설정으로 멈춤), 조용히
+폴백하지 않습니다 — 폴백이 있으면 `.env`를 빠뜨렸을 때 API는 200을 주는데 Spring만 결과를
+못 읽는 상태가 됩니다.
 
 ### `POST /analyze` · `POST /analyze/diary`
 
@@ -667,8 +669,8 @@ Redis에 저장된 문서를 그대로 돌려주는 **디버깅용** 엔드포�
 ### `GET /healthz`
 
 `face_model_available` / `detection_available` — 둘 다 `true`여야 분석 가능.
-`result_store` — `"redis"`(정상) / `"redis_unreachable"`(URL은 있는데 접속 불가) /
-`"memory"`(URL 미설정 — **Spring이 결과를 못 봅니다**). 배포 후 이 값부터 확인하세요.
+`result_store` — `"redis"`(정상) / `"redis_unreachable"`(접속 불가 — 제출이 503으로 거절됨).
+배포 후 이 값부터 확인하세요.
 
 ### 오류 응답
 
@@ -711,7 +713,7 @@ egress 프록시에서 allow-list 하는 편이 낫습니다.
 | `SKIN_METRICS_API_MAX_REDIRECTS` | `3` | 리다이렉트 허용 횟수 |
 | `SKIN_METRICS_API_ALLOW_PRIVATE_HOSTS` | `0` | **개발 전용** — SSRF 가드 해제 |
 | `SKIN_METRICS_API_MAX_CONCURRENCY` | `2` | 동시 분석 수 (파이프라인은 CPU 바운드) |
-| `SKIN_METRICS_REDIS_URL` | (없음) | `redis://user:password@host:port/db`. **`.env`에만** 두고 커밋 금지. 미설정 시 메모리 스토어 폴백 |
+| `SKIN_METRICS_REDIS_URL` | **필수** | `redis://user:password@host:port/db`. **`.env`에만** 두고 커밋 금지. 미설정 시 기동 실패 |
 | `SKIN_METRICS_RESULT_TTL` | `3600` | 결과가 Redis에 남아 있는 시간(초) |
 
 > `SKIN_METRICS_BIND`(기본 `127.0.0.1`)과 `SKIN_METRICS_PORT`(기본 `8000`)는 API가 아니라
@@ -923,7 +925,8 @@ curl http://<EC2-퍼블릭-IP>:8000/results/<request_id>:diary
 ```
 
 `curl <EC2-IP>:8000/healthz`의 **`result_store`가 `"redis"`인지 꼭 확인**하세요 —
-`"memory"`면 Redis URL이 전달되지 않은 것이고, Spring Boot가 결과를 읽을 수 없습니다.
+`"redis_unreachable"`이면 URL은 전달됐지만 접속이 안 되는 것(방화벽·자격증명·인스턴스 다운)이고,
+컨테이너가 아예 안 뜬다면 `docker logs`에 `SKIN_METRICS_REDIS_URL is not set`이 찍혀 있을 겁니다.
 
 재배포: 방법 A는 새 tar를 올려 `docker load` 후 컨테이너 재생성, 방법 B는
 `git pull && SKIN_METRICS_BIND=0.0.0.0 ./redeploy.sh`. 두 방법 모두
