@@ -173,16 +173,26 @@ composite:
     # Averaging the weak sites into the face-level value cost roughly half the
     # signal: phone all-ROIs +0.137 vs cheeks-only +0.176 on the same weights.
     rois: [left_cheek, right_cheek]
-    # `glcm_contrast` and `specular_inv` are dropped. On the cheeks they are
-    # uncorrelated-to-inverted against the Corneometer (glcm_contrast -0.002 on
-    # phone frontal), so they behaved as noise carried at 40% of the weight.
-    # Held-out cheek agreement: declared 4-feature set +0.176 -> +0.280 here.
-    # NOTE this metric remains a PROXY. +0.28 is a weak-to-moderate ranking, not
-    # a moisture measurement; the Corneometer reads stratum-corneum capacitance,
+    # Feature set from an exhaustive subset search over ALL extracted hydration
+    # features on the cheeks (fit on train, evaluated on held-out subjects,
+    # n=642 cheek rows). Three of the candidates -- glcm_correlation,
+    # glcm_energy, lbp_uniformity -- had been extracted all along but were never
+    # allowed into the composite; two of them turn out to matter:
+    #   {scaling_index 0.75, wrinkle_density 0.25}                  +0.240
+    #   {scaling_index +0.45, glcm_contrast -0.30, lbp_uniformity -0.25}
+    #                                                               +0.315
+    # Gain +0.074, subject-bootstrap 95% CI [+0.004, +0.144]. Selection by
+    # TRAIN rho lands on the same family, so this is not val-shopping.
+    # `glcm_contrast` returns as a SUPPRESSOR (negative weight): alone it is
+    # ~uncorrelated on the cheeks, but it cancels illumination-driven variance
+    # shared with scaling_index. `wrinkle_density` fits to ~-0.02 and is
+    # dropped. Per device: phone +0.29 / tablet +0.39 / DSLR +0.34.
+    # NOTE this metric remains a PROXY. +0.32 is a moderate ranking, not a
+    # moisture measurement; the Corneometer reads stratum-corneum capacitance,
     # which has no direct optical counterpart. `is_estimate` stays True.
-    weights: { scaling_index: 0.75, wrinkle_density: 0.25 }
+    weights: { scaling_index: 0.45, glcm_contrast: -0.30, lbp_uniformity: -0.25 }
     anchors:
-      scaling_index:   { mean: 0.10, std: 0.06 }
-      glcm_contrast:   { mean: 50.0, std: 30.0 }
-      wrinkle_density: { mean: 0.02, std: 0.02 }
-      specular_inv:    { mean: 0.0,  std: 0.05 }   # specular_inv = -specular_ratio (drier=less shine)
+      # Cohort-fitted fallbacks (calibration_profile.yaml overrides these).
+      scaling_index:  { mean: 0.002023, std: 0.000969 }
+      glcm_contrast:  { mean: 0.798882, std: 0.225395 }
+      lbp_uniformity: { mean: 0.212834, std: 0.031372 }

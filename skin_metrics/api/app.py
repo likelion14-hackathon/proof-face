@@ -2,8 +2,13 @@
 
 Endpoints
 ---------
-``GET  /healthz``   liveness + whether face detection is actually usable.
-``POST /analyze``   ``{"image_url": ...}`` -> :class:`~skin_metrics.scoring.schema.SkinReport`.
+``GET  /healthz``          liveness + whether face detection is actually usable.
+``POST /analyze``          ``{"image_url": ...}`` -> 0-100 ``pigmentation`` / ``erythema`` / ``hydration``.
+``POST /analyze/simple``   same body -> 0-10 ``skin_tone`` / ``dryness`` / ``redness``.
+
+Both responses share the same flat envelope: scores + ``confidence`` +
+``warnings`` + ``elapsed_ms`` + ``version`` + ``disclaimer``. The full
+:class:`~skin_metrics.scoring.schema.SkinReport` is CLI-only.
 
 Run it with::
 
@@ -37,9 +42,19 @@ from .schemas import (
     AnalyzeResponse,
     ErrorResponse,
     HealthResponse,
-    SourceInfo,
+    SimpleAnalyzeResponse,
 )
 from .settings import ApiSettings
+
+
+class AnalysisError(Exception):
+    """Pipeline failure carrying the HTTP status/code it should map to."""
+
+    def __init__(self, status_code: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.message = message
 
 _ERROR_RESPONSES: dict[int | str, dict] = {
     400: {"model": ErrorResponse, "description": "Invalid URL or undecodable image."},
@@ -117,9 +132,59 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
     )
     app.state.settings = cfg
 
+    async def _run_report(payload: AnalyzeRequest, request: Request):
+        """Fetch the image and score it; shared by both analyze endpoints.
+
+        Parameters
+        ----------
+        payload : AnalyzeRequest
+            Validated request body.
+        request : fastapi.Request
+            Incoming request (for app state).
+
+        Returns
+        -------
+        SkinReport
+            The scored report.
+
+        Raises
+        ------
+        ImageFetchError
+            Propagated from :func:`fetch_image` (handled app-wide).
+        AnalysisError
+            When the pipeline cannot score the image.
+        """
+        state = request.app.state
+        image, _meta = await fetch_image(str(payload.image_url), cfg, client=state.http)
+        bbox = tuple(payload.reference_bbox) if payload.reference_bbox else None
+
+        work = functools.partial(
+            run_analyze,
+            image,
+            ref_bbox=bbox,
+            model_path=state.face_model_path,
+            config=state.config,
+        )
+        try:
+            async with state.limiter:
+                report = await anyio.to_thread.run_sync(work)
+        except ValueError as exc:
+            # Pipeline refuses to score: no face, or every ROI failed the gate.
+            raise AnalysisError(422, "analysis_failed", str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise AnalysisError(503, "face_model_missing", str(exc)) from exc
+        except ImportError as exc:
+            raise AnalysisError(503, "detection_unavailable", str(exc)) from exc
+        return report
+
     @app.exception_handler(ImageFetchError)
     async def _fetch_error_handler(request: Request, exc: ImageFetchError):
         """Map fetch/decode failures onto the error envelope."""
+        return _error(exc.status_code, exc.code, exc.message)
+
+    @app.exception_handler(AnalysisError)
+    async def _analysis_error_handler(request: Request, exc: AnalysisError):
+        """Map pipeline failures onto the error envelope."""
         return _error(exc.status_code, exc.code, exc.message)
 
     @app.exception_handler(RequestValidationError)
@@ -142,41 +207,36 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
         tags=["analysis"],
     )
     async def analyze(payload: AnalyzeRequest, request: Request):
-        """Fetch ``image_url`` and return its :class:`SkinReport`.
+        """Fetch ``image_url`` and return its three 0-100 scores.
 
         The image is downloaded server-side under the SSRF/size limits in
         :mod:`skin_metrics.api.fetch`, then scored by
-        :func:`skin_metrics.pipeline.analyze` in a worker thread.
+        :func:`skin_metrics.pipeline.analyze` in a worker thread. The full
+        report is flattened to the same envelope shape as ``/analyze/simple``.
         """
         started = time.perf_counter()
-        state = request.app.state
-        url = str(payload.image_url)
-
-        image, meta = await fetch_image(url, cfg, client=state.http)
-        bbox = tuple(payload.reference_bbox) if payload.reference_bbox else None
-
-        work = functools.partial(
-            run_analyze,
-            image,
-            ref_bbox=bbox,
-            model_path=state.face_model_path,
-            config=state.config,
+        report = await _run_report(payload, request)
+        return AnalyzeResponse.from_report(
+            report, elapsed_ms=round((time.perf_counter() - started) * 1000.0, 2)
         )
-        try:
-            async with state.limiter:
-                report = await anyio.to_thread.run_sync(work)
-        except ValueError as exc:
-            # Pipeline refuses to score: no face, or every ROI failed the gate.
-            return _error(422, "analysis_failed", str(exc))
-        except FileNotFoundError as exc:
-            return _error(503, "face_model_missing", str(exc))
-        except ImportError as exc:
-            return _error(503, "detection_unavailable", str(exc))
 
-        return AnalyzeResponse(
-            report=report,
-            source=SourceInfo(url=url, **meta),
-            elapsed_ms=round((time.perf_counter() - started) * 1000.0, 2),
+    @app.post(
+        "/analyze/simple",
+        response_model=SimpleAnalyzeResponse,
+        responses=_ERROR_RESPONSES,
+        tags=["analysis"],
+    )
+    async def analyze_simple(payload: AnalyzeRequest, request: Request):
+        """Fetch ``image_url`` and return three consumer 0-10 scores.
+
+        Same fetch/limits/pipeline as ``/analyze``; the full report is then
+        collapsed by :meth:`SimpleAnalyzeResponse.from_report` into
+        ``skin_tone`` / ``dryness`` (당김·건조함) / ``redness``.
+        """
+        started = time.perf_counter()
+        report = await _run_report(payload, request)
+        return SimpleAnalyzeResponse.from_report(
+            report, elapsed_ms=round((time.perf_counter() - started) * 1000.0, 2)
         )
 
     return app

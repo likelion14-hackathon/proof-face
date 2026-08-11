@@ -21,6 +21,7 @@
 - [HTTP API](#http-api)
 - [Docker](#docker)
 - [테스트](#테스트)
+- [정확도를 더 올리려면 — 데이터 확보 가이드](#정확도를-더-올리려면--데이터-확보-가이드)
 - [알려진 한계 · TODO](#알려진-한계--todo)
 
 ---
@@ -59,6 +60,11 @@ skin-metrics train --dummy --mode ranking --epochs 3
 # HTTP API 서버 (docs: http://127.0.0.1:8000/docs)
 skin-metrics serve --download-model
 curl -X POST http://127.0.0.1:8000/analyze \
+  -H 'content-type: application/json' \
+  -d '{"image_url": "https://example.com/face.jpg"}'
+
+# 소비자용 0~10 요약 점수 (피부 톤 / 당김·건조함 / 붉은기)
+curl -X POST http://127.0.0.1:8000/analyze/simple \
   -H 'content-type: application/json' \
   -d '{"image_url": "https://example.com/face.jpg"}'
 ```
@@ -351,8 +357,8 @@ skin-metrics calibrate fit               # 프로파일 기록
 
 **composite 가중치**: 피팅한 가중치가 held-out에서 `config.yaml`의 선언된 가중치보다
 Spearman ≥ +0.05 더 좋을 때만 채택합니다. 현재 색소는 채택(+0.540 → +0.625),
-수분은 기각(+0.241 → +0.235). 수분은 손으로 정한 가중치가 이미 피팅 결과와 동률이라
-게이트가 선언값을 유지합니다.
+수분은 기각(+0.320 → +0.315). 수분은 `config.yaml`에 선언된 가중치가 이미 피팅 결과와
+동률이라(부분집합 탐색으로 고른 값이라 당연합니다) 게이트가 선언값을 유지합니다.
 
 > ⚠️ 이 게이트는 한동안 **수분을 잘못 기각**하고 있었습니다. `fit_composite_weights`가
 > `COMPOSITE_TARGET_SIGN`을 적용하지 않고 원본 타깃에 회귀해서, sign=-1인 수분에서
@@ -387,15 +393,15 @@ MAE가 "평균 예측" 대비 ≥5% 개선. 평균값만 예측하는 것과 별
 **앞의 십분위 표는 분포가 맞다는 뜻이지 순위가 맞다는 뜻이 아닙니다.** 실측과의 순위
 일치도(Spearman)는 별도로 측정해야 합니다. held-out 321명:
 
-| 지표 | 대상 | 최초(placeholder) | 1차 보정 | **현재** |
-|---|---|---|---|---|
-| pigmentation | 전문가 색소 등급 | +0.096 | +0.139 | **+0.422** |
-| pigmentation | 장비 스팟 개수 | +0.168 | +0.208 | **+0.578** |
-| hydration | Corneometer 수분 | -0.028 | +0.048 | **+0.241** |
-| erythema | — | 측정 불가 | 측정 불가 | 측정 불가 |
+| 지표 | 대상 | 최초(placeholder) | 1차 보정 | 수분 라운드 | **현재** |
+|---|---|---|---|---|---|
+| pigmentation | 전문가 색소 등급 | +0.096 | +0.139 | +0.422 | **+0.422** |
+| pigmentation | 장비 스팟 개수 | +0.168 | +0.208 | +0.578 | **+0.578** |
+| hydration | Corneometer 수분 | -0.028 | +0.048 | +0.241 | **+0.320** |
+| erythema | — | 측정 불가 | 측정 불가 | 측정 불가 | 측정 불가 |
 
 수분은 held-out **볼 642행** 기준입니다(집계 부위가 볼이므로 거기서 재는 게 맞습니다).
-기기별 +0.274(폰) / +0.253(태블릿) / +0.371(디지털카메라).
+기기별 +0.292(폰) / +0.389(태블릿) / +0.339(디지털카메라).
 
 기기별로도 일관됩니다 — 등급 기준 디지털카메라 +0.425 / 태블릿 +0.554 / 폰 +0.329
 (재가중 전에는 **-0.011** / +0.313 / +0.481로 기기마다 제각각이었습니다).
@@ -473,20 +479,30 @@ MAE가 "평균 예측" 대비 ≥5% 개선. 평균값만 예측하는 것과 별
 | chin | +0.072 | -0.019 | +0.005 |
 | nose | 장비 측정 부위 아님 (라벨 없음) | | |
 
-특징도 4개에서 2개로 줄였습니다 — `glcm_contrast`(볼에서 -0.002)와 `specular_inv`는
-무상관~역상관인데 가중치 40%를 차지하며 잡음으로 작동했습니다.
-최종 **`scaling_index` 0.75 / `wrinkle_density` 0.25**.
+특징 집합은 두 번에 걸쳐 바뀌었습니다. 수분 라운드에서 `glcm_contrast`(볼에서 단독
+-0.002)와 `specular_inv`를 빼고 `scaling_index` 0.75 / `wrinkle_density` 0.25로 갔는데
+(+0.241), 이후 **추출은 되고 있었지만 composite 후보에 든 적이 없는 특징 3개**
+(`glcm_correlation`/`glcm_energy`/`lbp_uniformity`)를 포함해 볼 전용 전수 부분집합
+탐색을 다시 돌린 결과가 현재 세트입니다:
+
+**`scaling_index` +0.45 / `glcm_contrast` -0.30 / `lbp_uniformity` -0.25 → held-out +0.320**
+
+- 개선 폭 +0.074, 피험자 단위 부트스트랩 95% CI [+0.004, +0.144] (P(개선)=0.98).
+  train 기준으로 골라도 같은 계열이 뽑히므로 val 쇼핑이 아닙니다.
+- `glcm_contrast`는 단독으로는 무상관이지만 **suppressor**(음수 가중치)로 돌아왔습니다 —
+  `scaling_index`와 공유하는 조명성 분산을 상쇄합니다. 음수 가중치는 버그가 아닙니다.
+- `wrinkle_density`는 피팅하면 ~-0.02로 수렴해 탈락했습니다.
 
 **시도했지만 채택하지 않은 것:**
 
 | 시도 | 결과 | 판단 |
 |---|---|---|
-| 측면 이미지(`--angles L,R`) 추가 | 볼이 1.7배 크게 잡혀 +0.053 → **+0.128** | 실재하는 효과지만 정면 재보정(+0.241)에 못 미침. 사용자에게 추가 촬영을 요구할 가치 없음 |
+| 측면 이미지(`--angles L,R`) 추가 | 볼이 1.7배 크게 잡혀 +0.053 → **+0.128** | 실재하는 효과지만 정면 재보정(+0.320)에 한참 못 미침. 사용자에게 추가 촬영을 요구할 가치 없음 |
 | 정규화 해제(원본 해상도) | +0.053 → **+0.003** (전 특징 악화) | 반증. 폰의 노이즈 리덕션·샤프닝이 원본에서 가짜 텍스처로 읽힘 |
 | 지도학습 릿지 | r=+0.173 | 게이트 탈락 |
 
 **여전히 proxy입니다.** Corneometer는 각질층의 **전기 용량**을 재고, RGB 표면 광학에는
-그 신호가 부분적으로만 담깁니다. +0.24는 **약~중간 수준의 순위 상관**이지 수분량 측정이
+그 신호가 부분적으로만 담깁니다. +0.32는 **중간 수준의 순위 상관**이지 수분량 측정이
 아닙니다. `is_estimate=True`와 "not a moisture measurement" 경고는 유지됩니다.
 수분 점수는 **"이 코호트 대비 볼 텍스처가 얼마나 거친가"**로 읽으세요.
 
@@ -500,7 +516,7 @@ MAE가 "평균 예측" 대비 ≥5% 개선. 평균값만 예측하는 것과 별
 |---|---|---|---|
 | pigmentation | 색소침착 많음/짙음 | 높을수록 나쁨 | 물리 측정, 실측 일치도 +0.63 |
 | erythema | 홍조 강함 | 높을수록 나쁨 | 물리 측정, **실측 검증 안 됨**(코호트 백분위) |
-| hydration | **더 촉촉함** | **높을수록 좋음** | **proxy 추정 (`is_estimate=True`)**, 실측 일치도 +0.24 |
+| hydration | **더 촉촉함** | **높을수록 좋음** | **proxy 추정 (`is_estimate=True`)**, 실측 일치도 +0.32 |
 
 > ⚠️ **`hydration`만 방향이 반대입니다.** 내부적으로는 세 지표 모두 "condition index"
 > (높을수록 뚜렷)로 계산되고, hydration의 driver·가중치·분위수 격자는 전부 **건조도**
@@ -554,17 +570,47 @@ OpenAPI 문서는 `/docs`, 스키마는 `/openapi.json`.
   "image_url": "https://example.com/face.jpg",   // 필수, http(s)
   "reference_bbox": [10, 10, 40, 40]             // 선택, [x, y, w, h] 중립 패치
 }
-// 응답 200 — 0~100 점수 3개만
+// 응답 200 — /analyze/simple과 동일한 평평한 형식, 스케일만 0~100
 {
-  "pigmentation": 54.52,
-  "erythema": 69.24,
-  "hydration": 24.63
+  "pigmentation": 38.39,   // 높을수록 색소침착 많음
+  "erythema": 55.52,       // 높을수록 붉음
+  "hydration": 70.80,      // 높을수록 촉촉 (proxy)
+  "confidence": { "pigmentation": 0.6, "erythema": 0.6, "hydration": 0.6 },
+  "warnings": [ /* ... */ ],
+  "elapsed_ms": 6900.0,
+  "version": "0.1.0",
+  "disclaimer": "This system is not a medical device. ..."
 }
 ```
 
-> API는 점수만 돌려줍니다. ROI별 내역·`raw_features`·`confidence`·`fitzpatrick_estimate`·
-> 의료기기 아님 고지가 필요하면 CLI `analyze`(전체 `SkinReport` JSON)를 쓰세요.
-> **고지는 응답에서 빠졌으므로 이 API를 쓰는 클라이언트가 직접 노출해야 합니다.**
+> 두 엔드포인트는 **같은 envelope**(점수 + `confidence` + `warnings` + `elapsed_ms` +
+> `version` + `disclaimer`)을 공유합니다. ROI별 내역·`raw_features`·
+> `fitzpatrick_estimate` 등 전체 `SkinReport`가 필요하면 CLI `analyze`를 쓰세요.
+
+### `POST /analyze/simple`
+
+요청 본문·응답 envelope은 `/analyze`와 동일. 점수만 소비자용 **0~10 축 3개**로 바뀝니다.
+
+```jsonc
+// 응답 200
+{
+  "skin_tone": 7.8,      // 피부 톤 밝기: 0=어두움, 10=매우 밝음 (ITA 선형 매핑)
+  "dryness": 2.9,        // 당김·건조함 정도: 0=촉촉, 10=매우 건조 (= (100-hydration)/10)
+  "redness": 5.6,        // 붉은기: 0=없음, 10=강함 (= erythema/10)
+  "confidence": { "skin_tone": 0.6, "dryness": 0.6, "redness": 0.6 },
+  "warnings": [ /* ... */ ],
+  "elapsed_ms": 6900.0,
+  "version": "0.1.0",
+  "disclaimer": "This system is not a medical device. ..."
+}
+```
+
+- **`skin_tone`은 절대 색상 기반(ITA)**이라 세 값 중 유일하게 카메라·조명에 민감합니다.
+  `reference_bbox`(그레이카드)를 주면 기기 독립적이 됩니다. ITA -30°(어두움)~+55°(매우
+  밝음)를 0~10에 선형 매핑, 범위 밖은 클립.
+- **`dryness`는 당김·건조함을 하나로** 제공합니다 — 당김은 감각이라 사진에서 분리 측정이
+  불가능하고, 광학적으로는 동일한 건조 신호입니다. hydration proxy와 같은 근거이므로
+  `is_estimate` 성격도 동일합니다.
 
 ### `GET /healthz`
 
@@ -734,6 +780,28 @@ uv run pytest -q          # 112 passed
   헤모글로빈 ICA(정상/퇴화), 텍스처·주름 프록시, ROI 기하·마스킹, 정규화·스키마,
   end-to-end 파이프라인, 보정 툴링(코퍼스 인덱싱·릿지 왕복·채택 게이트·분위수 매핑·프로파일 병합),
   Phase 2 forward/GRL/학습 루프(regression·ranking).
+
+---
+
+## 정확도를 더 올리려면 — 데이터 확보 가이드
+
+현재 프로파일은 기존 코호트에서 짜낼 수 있는 것을 거의 다 짜냈습니다(전수 특징 부분집합
+탐색까지 완료). 다음 단계는 전부 **새 데이터**가 필요하며, 지표별로 필요한 데이터와
+구할 수 있는 곳이 다릅니다.
+
+| 지표 | 병목 | 필요한 데이터 | 어디서 |
+|---|---|---|---|
+| **홍조** | 실측 라벨이 0장 → 검증 자체가 불가능 | ① 전문의 CEA 등급(0~4) 사진 채점 ② Mexameter/VISIA red 실측 | ①이 최선: **장비 불필요**, 기존 사진 200~300장 + 피부과 전문의 2명. ②는 VISIA 보유 피부과·에스테틱 제휴 |
+| **수분** | 표면 광학의 물리적 한계(+0.32) | 서비스 타깃 폰으로 찍은 정면 사진 + **Corneometer 동시 측정** (볼 좌우, 100명~) | 공개 데이터셋 없음. Corneometer CM825 대여/제휴 측정. AI-Hub에 추가 수분 실측 데이터셋 없음(028이 유일) |
+| **색소** | 지도학습이 기기 종속으로 탈락 | 타깃 폰 **단일 기종**으로 찍은 사진 + 전문가 등급 또는 장비 스팟 개수 | 공개 데이터셋 없음. 028 재활용 가능: `calibrate fit --device phone`(단, 타 기기 입력에 쓰면 안 됨) |
+| **피부 톤** (`/analyze/simple`) | 절대 색상이라 카메라·조명 민감 | 데이터가 아니라 **그레이카드**: 요청에 `reference_bbox` 포함 | 촬영 UI에 그레이카드/흰 종이 가이드 추가 |
+| **전 지표 (Phase 2)** | 딥러닝 미학습 | 이미 보유 — 028 라벨 38GB | `calibrate/aihub.py`의 `iter_roi_rows` → `train --data labels.csv --mode regression` |
+
+**공개 데이터셋에 기대지 마세요**: 얼굴 정면 표준 촬영 + 장비 실측이 붙은 공개 데이터는
+사실상 없습니다. Fitzpatrick17k(1.6만 장)·SCIN(1만 장+)은 병변 클로즈업/크라우드소싱에
+진단명 라벨이라 이 파이프라인의 타깃(정면 얼굴, 중증도·실측값)과 맞지 않고, VISIA+CEA
+임상 코호트(1,001명 규모)는 병원 보유라 비공개입니다. AI-Hub에서 얼굴 + 피부 실측이 붙은
+데이터셋은 028이 유일합니다.
 
 ---
 

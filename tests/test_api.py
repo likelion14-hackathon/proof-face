@@ -19,8 +19,9 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from skin_metrics.api.app import create_app  # noqa: E402
 from skin_metrics.api.fetch import ImageFetchError, decode_image, validate_url  # noqa: E402
-from skin_metrics.api.schemas import AnalyzeRequest  # noqa: E402
+from skin_metrics.api.schemas import AnalyzeRequest, SimpleAnalyzeResponse  # noqa: E402
 from skin_metrics.api.settings import ApiSettings  # noqa: E402
+from skin_metrics.scoring.schema import MetricScore, SkinReport  # noqa: E402
 
 
 def _png_bytes(image: np.ndarray) -> bytes:
@@ -179,23 +180,106 @@ def test_openapi_example_is_a_request_that_would_succeed(client):
     assert AnalyzeRequest.model_validate(example).reference_bbox is None
 
 
-def test_analyze_returns_report(client, image_server):
+def test_analyze_returns_flat_scores(client, image_server):
     resp = client.post("/analyze", json={"image_url": f"{image_server}/face.png"})
     assert resp.status_code == 200, resp.text
     body = resp.json()
 
-    report = body["report"]
     for metric in ("pigmentation", "erythema", "hydration"):
-        assert 0.0 <= report[metric]["score"] <= 100.0
-        assert 0.0 <= report[metric]["confidence"] <= 1.0
-    assert report["hydration"]["is_estimate"] is True
-    assert report["calibration_status"] in ("reference", "grayworld", "none")
-    assert 1 <= report["fitzpatrick_estimate"] <= 6
-    assert report["disclaimer"]
-
-    assert body["source"]["content_type"] == "image/png"
-    assert body["source"]["width"] == 500
+        assert 0.0 <= body[metric] <= 100.0
+        assert 0.0 <= body["confidence"][metric] <= 1.0
+    assert body["disclaimer"]
     assert body["elapsed_ms"] >= 0.0
+
+
+def test_analyze_and_simple_share_the_same_envelope(client, image_server):
+    """Both endpoints must answer in the same flat shape, only the scores differ."""
+    full = client.post("/analyze", json={"image_url": f"{image_server}/face.png"}).json()
+    simple = client.post(
+        "/analyze/simple", json={"image_url": f"{image_server}/face.png"}
+    ).json()
+
+    full_scores = {"pigmentation", "erythema", "hydration"}
+    simple_scores = {"skin_tone", "dryness", "redness"}
+    assert set(full) - full_scores == set(simple) - simple_scores
+    assert set(full["confidence"]) == full_scores
+    assert set(simple["confidence"]) == simple_scores
+
+
+def _report_stub(ita=None, hydration=70.0, erythema=35.0) -> SkinReport:
+    """Minimal SkinReport for exercising the simple-score mapping."""
+    pig_features = {} if ita is None else {"ita": ita}
+    return SkinReport(
+        pigmentation=MetricScore(score=50.0, confidence=0.8, raw_features=pig_features),
+        erythema=MetricScore(score=erythema, confidence=0.7),
+        hydration=MetricScore(score=hydration, confidence=0.6, is_estimate=True),
+        calibration_status="none",
+        fitzpatrick_estimate=3,
+    )
+
+
+def test_simple_mapping_orients_and_scales_each_score():
+    simple = SimpleAnalyzeResponse.from_report(
+        _report_stub(ita=34.5, hydration=70.0, erythema=35.0), elapsed_ms=1.0
+    )
+    # ITA 34.5 sits (34.5+30)/85 of the way from dark to very light.
+    assert simple.skin_tone == pytest.approx(round(10.0 * 64.5 / 85.0, 1))
+    # hydration 70 (moist) -> dryness 3.0; erythema 35 -> redness 3.5.
+    assert simple.dryness == pytest.approx(3.0)
+    assert simple.redness == pytest.approx(3.5)
+    assert simple.confidence == {"skin_tone": 0.8, "dryness": 0.6, "redness": 0.7}
+
+
+@pytest.mark.parametrize("ita,expected", [(55.0, 10.0), (-30.0, 0.0), (90.0, 10.0), (-80.0, 0.0)])
+def test_simple_mapping_clips_skin_tone_to_0_10(ita, expected):
+    simple = SimpleAnalyzeResponse.from_report(_report_stub(ita=ita), elapsed_ms=1.0)
+    assert simple.skin_tone == pytest.approx(expected)
+
+
+def test_simple_mapping_survives_a_missing_ita():
+    """No `ita` in raw_features -> Fitzpatrick bucket centre, not a crash."""
+    simple = SimpleAnalyzeResponse.from_report(_report_stub(ita=None), elapsed_ms=1.0)
+    assert 0.0 <= simple.skin_tone <= 10.0
+
+
+def test_analyze_simple_returns_scores(client, image_server):
+    resp = client.post("/analyze/simple", json={"image_url": f"{image_server}/face.png"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    for field in ("skin_tone", "dryness", "redness"):
+        assert 0.0 <= body[field] <= 10.0
+        assert 0.0 <= body["confidence"][field] <= 1.0
+    assert body["disclaimer"]
+    assert body["elapsed_ms"] >= 0.0
+
+
+def test_analyze_simple_is_consistent_with_the_full_scores(client, image_server):
+    full = client.post("/analyze", json={"image_url": f"{image_server}/face.png"}).json()
+    simple = client.post(
+        "/analyze/simple", json={"image_url": f"{image_server}/face.png"}
+    ).json()
+    assert simple["dryness"] == pytest.approx(
+        round((100.0 - full["hydration"]) / 10.0, 1), abs=0.05
+    )
+    assert simple["redness"] == pytest.approx(round(full["erythema"] / 10.0, 1), abs=0.05)
+
+
+def test_analyze_simple_propagates_fetch_errors(client, image_server):
+    resp = client.post("/analyze/simple", json={"image_url": f"{image_server}/missing.png"})
+    assert resp.status_code == 502
+    assert resp.json()["error"]["code"] == "upstream_error"
+
+
+def test_analyze_simple_reports_missing_face(monkeypatch, image_server):
+    monkeypatch.setattr(
+        "skin_metrics.pipeline.detect_landmarks", lambda img, model_path=None: None
+    )
+    with TestClient(create_app(ApiSettings(allow_private_hosts=True))) as faceless:
+        resp = faceless.post(
+            "/analyze/simple", json={"image_url": f"{image_server}/face.png"}
+        )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "analysis_failed"
 
 
 def test_analyze_with_reference_bbox(client, image_server):
@@ -204,13 +288,12 @@ def test_analyze_with_reference_bbox(client, image_server):
         json={"image_url": f"{image_server}/face.png", "reference_bbox": [5, 5, 20, 20]},
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["report"]["calibration_status"] == "reference"
 
 
 def test_analyze_follows_redirect(client, image_server):
     resp = client.post("/analyze", json={"image_url": f"{image_server}/redirect"})
     assert resp.status_code == 200, resp.text
-    assert resp.json()["source"]["final_url"].endswith("/face.png")
+    assert 0.0 <= resp.json()["pigmentation"] <= 100.0
 
 
 def test_analyze_redirect_loop_is_bounded(client, image_server):

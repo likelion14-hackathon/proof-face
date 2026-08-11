@@ -12,7 +12,35 @@
 
 ## 현재 상태 (2026-08-11 기준)
 
-### 이번 라운드에서 바뀐 것 (레퍼런스 보정)
+### 최신 라운드 (특징 부분집합 탐색 + `/analyze/simple`)
+
+1. **수분 +0.241 → +0.320 (held-out 볼 642행)** — 추출은 되고 있었지만 composite 후보에
+   든 적이 없는 특징 3개(`glcm_correlation`/`glcm_energy`/`lbp_uniformity`)를 포함해
+   볼 전용 전수 부분집합 탐색을 돌린 결과. 최종 세트
+   **`scaling_index` +0.45 / `glcm_contrast` -0.30 / `lbp_uniformity` -0.25**.
+   개선 +0.074, 피험자 부트스트랩 95% CI [+0.004, +0.144]; train 기준 선택도 같은 계열이라
+   val 쇼핑 아님. `glcm_contrast`는 단독 무상관이지만 **suppressor**(음수 가중치)로
+   복귀 — 음수 가중치는 버그가 아닙니다. `wrinkle_density`는 ~-0.02로 수렴해 탈락.
+   기기별 +0.292(폰) / +0.389(태블릿) / +0.339(DSLR). **재추출 불필요였음** — face CSV가
+   이미 볼 집계로 전 특징을 들고 있음.
+2. **`POST /analyze/simple` 추가** — 소비자용 0~10 점수 3개: `skin_tone`(ITA -30°~55° →
+   0~10 선형, 절대 색상이라 기기 민감), `dryness`(당김·건조함 통합, `(100-hydration)/10`),
+   `redness`(`erythema/10`). 매핑은 `api/schemas.py`의
+   `SimpleAnalyzeResponse.from_report`. `app.py`는 두 엔드포인트가 fetch→파이프라인→오류
+   매핑을 `_run_report` + `AnalysisError` 핸들러로 공유하도록 리팩토링.
+   컨테이너에서 실사진 검증 완료(cohort 정면 → tone 7.8 / dryness 2.9 / redness 5.6).
+3. **`/analyze`도 같은 평평한 envelope으로 통일** (사용자 요청) — 중첩 `report`/`source`
+   대신 0~100 점수 3개 + `confidence` + `warnings` + `disclaimer`. 두 엔드포인트의 응답
+   형식이 점수 축만 다르고 동일함(`tests/test_api.py::
+   test_analyze_and_simple_share_the_same_envelope`이 지킴). `SourceInfo`는 삭제됨.
+   전체 `SkinReport`가 필요하면 CLI `analyze`.
+4. **README에 "데이터 확보 가이드" 섹션 추가** — 지표별 다음 데이터 소스 정리.
+   핵심: 얼굴 정면 + 장비 실측이 붙은 공개 데이터셋은 028 외에 사실상 없음. 홍조는
+   전문의 CEA 채점(장비 불필요)이 최선, 수분·색소는 타깃 폰 + 장비 동시 측정 필요.
+
+테스트 134개 통과.
+
+### 이전 라운드 (레퍼런스 보정)
 
 AI-Hub 《028. 한국인 피부상태 측정 데이터》(965명 / 정면 2,895장 / ROI 11,580행 /
 Corneometer·전문가 등급 실측)로 보정하면서 **정확도 관련 실제 버그 3건**을 찾아 고쳤습니다.
@@ -84,10 +112,11 @@ Corneometer·전문가 등급 실측)로 보정하면서 **정확도 관련 실�
    | chin | +0.072 | -0.019 | +0.005 |
    → `composite.<metric>.rois`로 지표별 집계 ROI 제한 도입(`pipeline._aggregation_rois`).
    `glcm_contrast`/`specular_inv`도 볼에서 무상관~역상관이라 제거.
-   특징 4개 → **`scaling_index` 0.75 / `wrinkle_density` 0.25**.
+   특징 4개 → `scaling_index` 0.75 / `wrinkle_density` 0.25.
+   (이후 최신 라운드의 부분집합 탐색으로 현재 세트로 교체됨 — 위 참조.)
 
-**수분 실측 일치도 +0.048(얼굴 단위) → +0.241(볼, held-out n=642)**.
-기기별 +0.274(폰) / +0.253(태블릿) / +0.371(DSLR). 여전히 **proxy**이며 `is_estimate=True` 유지.
+**수분 실측 일치도 +0.048(얼굴 단위) → +0.241(볼, held-out n=642) → 현재 +0.320**.
+여전히 **proxy**이며 `is_estimate=True` 유지.
 
 **시도했지만 채택 안 한 것** (근거 남김):
 - **측면 이미지**(`--angles L,R`, 폰 1,930장): 볼이 1.7배 크게 잡혀 실제로 개선되지만
@@ -100,11 +129,11 @@ Corneometer·전문가 등급 실측)로 보정하면서 **정확도 관련 실�
 
 ### 기존 상태
 
-- ✅ **Phase 1 완료** — 전 모듈 구현, 단위 테스트 **112개 통과**(API·보정 툴링 포함).
+- ✅ **Phase 1 완료** — 전 모듈 구현, 단위 테스트 **134개 통과**(API·보정 툴링 포함).
 - ✅ **Phase 2 스캐폴드 완료** — dataset(+더미)/network/train, 더미로 학습 루프 end-to-end 확인.
 - ✅ 실제 이미지 경로(MediaPipe **Tasks API**) 동작하도록 `detect_landmarks` 이중 API 지원.
 - ✅ **HTTP API 완료** (`skin_metrics/api/`, `api` extra) — `POST /analyze`(이미지 URL) /
-  `GET /healthz`. 실제 사진으로 end-to-end 확인(36MP → 약 66초).
+  `POST /analyze/simple`(0~10 소비자 점수) / `GET /healthz`. 실제 사진으로 end-to-end 확인.
 - ✅ **Docker 완료** — `Dockerfile`(멀티스테이지, `api`/`full`) · `docker-compose.yml` ·
   deny-all `.dockerignore`. 두 타깃 모두 arm64에서 검증:
   `api`(1.72GB) 빌드→기동→`/analyze`, `full`(2.88GB) `train --dummy` 정상 완료.
@@ -201,9 +230,11 @@ HTTP API (`api` extra):
 api.app.create_app(settings) → FastAPI          # 모듈 최상단 app = create_app() (uvicorn 타깃)
 ├─ lifespan: load_config / ensure|resolve_face_model / anyio.Semaphore / 공유 httpx.AsyncClient
 ├─ GET  /healthz  → face_model_available · detection_available
-└─ POST /analyze  → api.fetch.fetch_image(URL 검증·스트리밍·디코딩)
-                  → anyio.to_thread.run_sync(pipeline.analyze)  # CPU 바운드
-                  → AnalyzeResponse(report, source, elapsed_ms)
+├─ POST /analyze         ┐ 공유 _run_report: api.fetch.fetch_image(URL 검증·스트리밍·디코딩)
+└─ POST /analyze/simple  ┘ → anyio.to_thread.run_sync(pipeline.analyze)  # CPU 바운드
+   두 응답 모두 평평한 동일 envelope (점수 + confidence + warnings + disclaimer):
+   /analyze = 0~100 AnalyzeResponse.from_report, /simple = 0~10 SimpleAnalyzeResponse.from_report
+   전체 SkinReport는 CLI 전용
 api.settings.ApiSettings.from_env()  # SKIN_METRICS_API_* (한도·타임아웃·동시성)
 ```
 
@@ -254,6 +285,12 @@ Phase 2: `models.dataset(SkinDataset/DummyLabelGenerator)` → `models.network.S
   거기 적힌 **특징 목록이 피팅 대상 집합**을 정합니다(anchor도 이 목록으로 만들어짐).
 - **composite 가중치는 음수가 될 수 있습니다**(suppressor). 정규화는 반드시 `|w|` 합으로.
   부호 있는 합으로 나누면 합이 0 근처일 때 폭발하거나 조용히 0이 됩니다.
+  현재 수분 세트의 `glcm_contrast` -0.30 / `lbp_uniformity` -0.25가 실제 예 — 단독으론
+  무상관이지만 suppressor로 +0.075를 벌어줍니다. "음수라서" 지우면 안 됩니다.
+- **`/analyze/simple`의 `dryness`는 리포트 방향(높을수록 촉촉) 위에서 한 번 더 뒤집습니다**
+  (`(100-hydration)/10`). `scoring.report_inverted`를 건드리면
+  `SimpleAnalyzeResponse.from_report`와 `tests/test_api.py`의 simple 테스트도 같이 확인.
+  `skin_tone`은 ITA 절대 색상 기반이라 simple 응답에서 유일하게 기기·조명 민감.
 - **절대 색상 특징은 기기 간 전이 안 됨**. `melanin_index`/`ita`를 composite에 다시
   넣으려면 그레이카드/컬러체커 보정(`--reference-bbox`)이 전제되어야 합니다.
 - **`calibrate fit`은 `load_config(use_profile=False)`로 읽어야** 합니다. 안 그러면
@@ -309,9 +346,9 @@ Phase 2: `models.dataset(SkinDataset/DummyLabelGenerator)` → `models.network.S
    `calibrate/fit.py`의 `specs` 튜플에 한 줄 추가하면 그대로 붙습니다.
 2. **색소 모델 개선**: 현재 릿지(선형)로 held-out r≈0.54. 특징을 늘리거나
    (ROI별 상수항, 나이 대용 특징) 순서형 회귀로 바꾸면 더 오를 여지가 있습니다.
-   ※ 수분은 위 "수분력 라운드" 참조 — 버그 2건 수정으로 +0.241까지 올라왔습니다.
-   다음 레버는 **볼 전용 텍스처 특징**(현재 `scaling_index`가 가중치 0.75를 홀로 짊어짐)
-   이나 **TEWL/Corneometer 자체 측정**입니다.
+   ※ 수분은 +0.320까지 왔습니다(부분집합 탐색으로 기존 추출 특징은 소진).
+   다음 레버는 **새 볼 전용 텍스처 특징**(재추출 필요, 27분) 아니면
+   **TEWL/Corneometer 자체 측정**입니다.
 3. **Phase 2 실학습**: 라벨 CSV가 이제 실제로 존재합니다.
    `calibrate/aihub.py`의 `iter_roi_rows`로 `SkinDataset.from_csv` 형식을 만들면
    `train --data labels.csv --mode regression` 가능. 다만 38GB 이미지 학습이라
