@@ -126,12 +126,14 @@ class AcceptedResponse(BaseModel):
     a JSON document -- see :mod:`skin_metrics.api.results` for its shape. The
     consumer (Spring Boot) reads that key straight from Redis; ``GET
     /results/{key}`` exposes the same document over HTTP for debugging.
+
+    Just the two identifiers: the 202 status code already says "accepted, still
+    processing", and the stored document carries the ``status`` that actually
+    changes over time.
     """
 
     request_id: str
     redis_key: str = Field(description='Store key, "{request_id}:{kind}".')
-    status: str = "processing"
-    version: str = __version__
 
 
 class DiaryAnalyzeResponse(BaseModel):

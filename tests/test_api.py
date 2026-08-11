@@ -203,7 +203,8 @@ def _submit(client, path, body):
     accepted = resp.json()
     kind = path.rsplit("/", 1)[-1] if path != "/analyze" else "analyze"
     assert accepted["redis_key"] == f"{accepted['request_id']}:{kind}"
-    assert accepted["status"] == "processing"
+    # Identifiers only; the 202 itself means "accepted, still processing".
+    assert set(accepted) == {"request_id", "redis_key"}
     return accepted
 
 

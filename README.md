@@ -602,11 +602,12 @@ URL을 설정하지 않으면 프로세스 내부 메모리 스토어로 폴백�
 ```jsonc
 {
   "request_id": "470b634e92bd44b9abeb12accb0f0b70",
-  "redis_key": "470b634e92bd44b9abeb12accb0f0b70:analyze",  // diary면 ...:diary
-  "status": "processing",
-  "version": "0.1.0"
+  "redis_key": "470b634e92bd44b9abeb12accb0f0b70:analyze"   // diary면 ...:diary
 }
 ```
+
+202라는 상태 코드 자체가 "접수됨, 처리 중"을 뜻하므로 본문에는 식별자만 담습니다.
+진행 상태는 저장 문서의 `status`(`processing`→`done`/`failed`)로 확인하세요.
 
 **Redis에 저장되는 문서** (JSON 문자열, TTL 기본 1시간):
 
@@ -917,7 +918,7 @@ curl http://<EC2-퍼블릭-IP>:8000/healthz
 curl -X POST http://<EC2-퍼블릭-IP>:8000/analyze/diary \
   -H 'content-type: application/json' \
   -d '{"image_url":"https://example.com/face.jpg"}'
-# → {"request_id": "...", "redis_key": "...:diary", ...}
+# → {"request_id": "...", "redis_key": "...:diary"}
 curl http://<EC2-퍼블릭-IP>:8000/results/<request_id>:diary
 ```
 

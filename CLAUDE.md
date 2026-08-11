@@ -290,7 +290,7 @@ HTTP API (`api` extra):
 api.app.create_app(settings) → FastAPI          # 모듈 최상단 app = create_app() (uvicorn 타깃)
 ├─ lifespan: load_config / ensure|resolve_face_model / anyio.Semaphore / 공유 httpx.AsyncClient
 ├─ GET  /healthz  → face_model_available · detection_available · result_store
-├─ POST /analyze        ┐ validate_url(동기 4xx) → 202 {request_id, redis_key}
+├─ POST /analyze        ┐ validate_url(동기 4xx) → 202 {request_id, redis_key} (그게 전부)
 ├─ POST /analyze/diary  ┘ → asyncio.create_task(_process)
 │     _process: fetch_image → anyio.to_thread.run_sync(pipeline.analyze)  # CPU 바운드
 │               → results.finish/fail → Redis {request_id}:{kind} (TTL)
