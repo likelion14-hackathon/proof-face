@@ -242,9 +242,15 @@ uv run skin-metrics calibrate fit --dry-run               # 검증 수치만
 uv run skin-metrics calibrate fit                         # calibration_profile.yaml 기록
 
 ./redeploy.sh                                             # down→build→up→헬스 대기
+SKIN_METRICS_BIND=0.0.0.0 ./redeploy.sh                   # 외부 노출 (EC2)
 docker build -t skin-metrics-api:0.1.0 .                  # 기본 = api 타깃 (torch 없음)
 docker build --target full -t skin-metrics-api:0.1.0-full .   # + Phase 2
 docker compose up --build                                 # 127.0.0.1:8000
+
+# 이미지 배포 (ghcr.io) — main 푸시 시 자동. 수동 실행/상태 확인:
+gh workflow run publish-image.yml                         # 수동 트리거
+gh workflow run publish-image.yml -f platforms=linux/amd64,linux/arm64   # Graviton도
+gh run list --workflow=publish-image.yml --limit 3
 ```
 
 ## 아키텍처 지도 (수정 시 진입점)
