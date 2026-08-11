@@ -37,8 +37,25 @@
 4. **README에 "데이터 확보 가이드" 섹션 추가** — 지표별 다음 데이터 소스 정리.
    핵심: 얼굴 정면 + 장비 실측이 붙은 공개 데이터셋은 028 외에 사실상 없음. 홍조는
    전문의 CEA 채점(장비 불필요)이 최선, 수분·색소는 타깃 폰 + 장비 동시 측정 필요.
+5. **EC2 배포 대응** — 해커톤 배포용. 세 가지가 막고 있었음:
+   - 🐛 **메모리**: 피크 RSS가 **메가픽셀당 약 63MB**(내부 float64). 40MP 이미지 1건이
+     2.5GB이고 `MAX_CONCURRENCY=2`면 5GB → compose `memory: 4g`를 넘겨 **OOM으로 사망**.
+     → `SKIN_METRICS_API_ANALYSIS_MAX_PIXELS`(기본 16MP) 도입. 초과분은 **거절이 아니라
+     분석 직전 축소**(`fetch.decode_image(analysis_max_pixels=...)`). 폰 48MP 사진도
+     413 없이 동작. 파이프라인이 어차피 eye-span 512px로 정규화하므로 정확도 손실 없음
+     (축소로 얼굴이 작아지면 기존 `under_resolved`가 그대로 처리).
+     `max_pixels`(40MP)는 압축폭탄 하드 리젝으로 유지 — 두 한도는 역할이 다름.
+   - **바인딩**: compose가 `127.0.0.1` 고정이라 인스턴스 밖에서 접근 불가.
+     → `${SKIN_METRICS_BIND:-127.0.0.1}`로 변경. 기본값은 안전하게 루프백 유지.
+     `SKIN_METRICS_BIND=0.0.0.0 ./redeploy.sh`로 노출. LAN IP 접근까지 실측 확인.
+   - **아키텍처**: 이 맥은 arm64, 대부분의 EC2는 x86_64 → 이미지를 옮기면
+     `exec format error`. → README는 **인스턴스 위에서 빌드**를 권장(양쪽 아키텍처 모두
+     해결되고 1.7GB 업로드도 불필요).
 
-테스트 134개 통과.
+   실측(컨테이너, CPU 2개 제한): 6.5MP 6.4s/647MB · 12MP 6.8s/1.0GB · 24MP 8.1s/1.7GB ·
+   40MP 8.9s/2.5GB. 27.5MP 입력 → 16MP 축소 → 6.2s/1.37GB 정상 분석 확인.
+
+테스트 137개 통과.
 
 ### 이전 라운드 (레퍼런스 보정)
 
@@ -129,7 +146,7 @@ Corneometer·전문가 등급 실측)로 보정하면서 **정확도 관련 실�
 
 ### 기존 상태
 
-- ✅ **Phase 1 완료** — 전 모듈 구현, 단위 테스트 **134개 통과**(API·보정 툴링 포함).
+- ✅ **Phase 1 완료** — 전 모듈 구현, 단위 테스트 **137개 통과**(API·보정 툴링 포함).
 - ✅ **Phase 2 스캐폴드 완료** — dataset(+더미)/network/train, 더미로 학습 루프 end-to-end 확인.
 - ✅ 실제 이미지 경로(MediaPipe **Tasks API**) 동작하도록 `detect_landmarks` 이중 API 지원.
 - ✅ **HTTP API 완료** (`skin_metrics/api/`, `api` extra) — `POST /analyze`(이미지 URL) /

@@ -10,14 +10,21 @@ services:
       context: .
       target: api
     image: skin-metrics-api:0.1.0
-    # Bound to loopback: there is no auth or rate limiting in front of /analyze.
-    # Override the host port when 8000 is taken: SKIN_METRICS_PORT=8100 docker compose up -d
+    # Loopback by default: there is no auth or rate limiting in front of
+    # /analyze, so exposing it publicly is an explicit opt-in.
+    #   SKIN_METRICS_PORT=8100 docker compose up -d     # port 8000 taken
+    #   SKIN_METRICS_BIND=0.0.0.0 docker compose up -d  # reachable off-host (EC2)
     ports:
-      - "127.0.0.1:${SKIN_METRICS_PORT:-8000}:8000"
+      - "${SKIN_METRICS_BIND:-127.0.0.1}:${SKIN_METRICS_PORT:-8000}:8000"
     environment:
       # See README "HTTP API" for the full list of knobs.
       SKIN_METRICS_API_MAX_CONCURRENCY: "2"
+      # Hard reject (decompression bombs) vs the budget the pipeline actually
+      # gets. Peak RSS is ~63MB per megapixel, so the 16MP budget keeps a
+      # single analysis near 1.2GB and two concurrent ones inside the 4g limit
+      # below. Bigger inputs are downscaled, not rejected.
       SKIN_METRICS_API_MAX_PIXELS: "40000000"
+      SKIN_METRICS_API_ANALYSIS_MAX_PIXELS: "16000000"
       SKIN_METRICS_API_MAX_BYTES: "20971520"
       SKIN_METRICS_API_FETCH_TIMEOUT: "10.0"
       # SSRF guard. Leave off in any shared/production environment.

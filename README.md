@@ -20,6 +20,7 @@
 - [CLI 레퍼런스](#cli-레퍼런스)
 - [HTTP API](#http-api)
 - [Docker](#docker)
+- [AWS EC2 배포](#aws-ec2-배포)
 - [테스트](#테스트)
 - [정확도를 더 올리려면 — 데이터 확보 가이드](#정확도를-더-올리려면--데이터-확보-가이드)
 - [알려진 한계 · TODO](#알려진-한계--todo)
@@ -648,16 +649,21 @@ egress 프록시에서 allow-list 하는 편이 낫습니다.
 | `SKIN_METRICS_FACE_MODEL` | 캐시 경로 | FaceLandmarker `.task` 경로 |
 | `SKIN_METRICS_API_DOWNLOAD_MODEL` | `0` | 시작 시 모델 자동 다운로드 |
 | `SKIN_METRICS_API_MAX_BYTES` | `20971520` (20MB) | 다운로드 바이트 상한 |
-| `SKIN_METRICS_API_MAX_PIXELS` | `40000000` | 디코딩 픽셀 상한 |
+| `SKIN_METRICS_API_MAX_PIXELS` | `40000000` | 디코딩 픽셀 **하드 상한** (압축폭탄 방어, 초과 시 413) |
+| `SKIN_METRICS_API_ANALYSIS_MAX_PIXELS` | `16000000` | 분석 픽셀 **예산**. 초과 시 거절 대신 **축소**. 메모리가 MP당 약 63MB로 늘어나므로 이 값이 피크 메모리를 결정 |
 | `SKIN_METRICS_API_FETCH_TIMEOUT` | `10.0` | 다운로드 타임아웃(초) |
 | `SKIN_METRICS_API_MAX_REDIRECTS` | `3` | 리다이렉트 허용 횟수 |
 | `SKIN_METRICS_API_ALLOW_PRIVATE_HOSTS` | `0` | **개발 전용** — SSRF 가드 해제 |
 | `SKIN_METRICS_API_MAX_CONCURRENCY` | `2` | 동시 분석 수 (파이프라인은 CPU 바운드) |
 
-> **응답 시간**: 분석은 동기·CPU 바운드라 워커 스레드 + 세마포어로 실행됩니다.
-> 36MP(4912×7360) 사진 기준 **1건에 약 66초**가 걸리므로, 상한 픽셀을 낮추거나
-> 클라이언트에서 리사이즈해 올리는 것을 권장합니다(단, 리샘플링은 텍스처 기반 수분력
-> 프록시 값을 바꿉니다). 트래픽이 있다면 큐 + 작업 ID 방식으로 바꾸는 편이 좋습니다.
+> `SKIN_METRICS_BIND`(기본 `127.0.0.1`)과 `SKIN_METRICS_PORT`(기본 `8000`)는 API가 아니라
+> **compose가 읽는 변수**로, 호스트 쪽 바인딩 주소·포트를 정합니다.
+
+> **응답 시간·메모리**: 분석은 동기·CPU 바운드라 워커 스레드 + 세마포어로 실행됩니다.
+> 얼굴 크기 정규화가 들어간 뒤로는 **입력 해상도가 시간에 거의 영향을 주지 않습니다**
+> (6.5MP 6.4초 → 40MP 8.9초). 반면 **메모리는 메가픽셀당 약 63MB로 선형 증가**하므로
+> 실질적인 제약은 시간이 아니라 메모리입니다 — 자세한 수치와 인스턴스 사이징은
+> [AWS EC2 배포](#aws-ec2-배포) 참고. 트래픽이 늘면 큐 + 작업 ID 방식이 필요합니다.
 
 ---
 
@@ -752,10 +758,102 @@ Docker Hub만 있으면 됩니다(일부 네트워크에서 ghcr 익명 pull이 
 `data/`의 얼굴 사진, `report*.json`, `tests/`, `.venv/`, `.git/`, `*.task`는 **어떤 경로로도
 이미지에 포함되지 않습니다**. 나중에 새 파일이 생겨도 기본이 차단이라 안전합니다.
 
+### AWS EC2 배포
+
+**빌드는 EC2 인스턴스 위에서 하세요.** 맥에서 만든 이미지를 그대로 올리면 아키텍처가
+어긋납니다(맥 = arm64, 대부분의 EC2 = x86_64 → `exec format error`). 인스턴스에서 빌드하면
+그 인스턴스의 아키텍처로 맞춰지므로 이 문제 자체가 사라지고, 1.7GB를 업로드할 필요도 없습니다.
+
+#### 1. 인스턴스 선택
+
+| 타입 | vCPU / RAM | 비고 |
+|---|---|---|
+| `t3.medium` | 2 / 4GB | **최소**. 버스터블이라 연속 요청 시 CPU 크레딧 소진 주의 |
+| **`t3.large`** | 2 / 8GB | **권장** — 메모리 여유가 있어 동시 요청에 안전 |
+| `c6i.large` | 2 / 4GB | 비버스터블. CPU 성능이 일정해야 하면 |
+| `t4g.large` | 2 / 8GB | **arm64(Graviton)**, 약 20% 저렴. 이 저장소는 arm64에서도 빌드·검증됨 |
+
+- **EBS 루트 볼륨 30GB** (기본 8GB로는 빌드 캐시가 안 들어갑니다)
+- **보안 그룹**: 인바운드 TCP `8000`(또는 프록시를 쓸 경우 80/443). 아웃바운드는 기본값
+  그대로 두세요 — `/analyze`가 이미지 URL을 받아오려면 외부로 나갈 수 있어야 합니다.
+
+#### 2. 인스턴스 준비 (Amazon Linux 2023)
+
+```bash
+sudo dnf install -y docker git
+sudo systemctl enable --now docker
+sudo usermod -aG docker ec2-user      # 적용하려면 재로그인
+
+# compose v2 플러그인 (AL2023 기본 포함 아님)
+sudo mkdir -p /usr/libexec/docker/cli-plugins
+sudo curl -sSL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-$(uname -m) \
+  -o /usr/libexec/docker/cli-plugins/docker-compose
+sudo chmod +x /usr/libexec/docker/cli-plugins/docker-compose
+docker compose version
+```
+
+> Ubuntu면 `sudo apt install -y docker.io docker-compose-v2 git` 로 대체.
+
+#### 3. 배포
+
+```bash
+git clone https://github.com/likelion14-hackathon/proof-face.git
+cd proof-face
+
+# 0.0.0.0 바인딩이 있어야 인스턴스 밖에서 접근됩니다 (기본은 루프백)
+SKIN_METRICS_BIND=0.0.0.0 ./redeploy.sh
+```
+
+빌드 약 3~5분, 그 뒤 헬스체크 통과까지 자동으로 기다립니다. 확인:
+
+```bash
+curl http://<EC2-퍼블릭-IP>:8000/healthz
+curl -X POST http://<EC2-퍼블릭-IP>:8000/analyze/simple \
+  -H 'content-type: application/json' \
+  -d '{"image_url":"https://example.com/face.jpg"}'
+```
+
+재배포는 `git pull && SKIN_METRICS_BIND=0.0.0.0 ./redeploy.sh` 하나면 됩니다.
+`restart: unless-stopped`가 걸려 있어 인스턴스를 재부팅해도 컨테이너가 살아납니다.
+
+#### 4. 성능·메모리 (실측)
+
+이 맥에서 컨테이너 CPU 2개 제한으로 잰 값입니다. EC2 x86 vCPU는 더 느리므로
+**시간은 2~3배로 잡으세요**(메모리는 아키텍처와 무관하게 동일).
+
+| 입력 | 소요 시간 | 피크 메모리 |
+|---|---|---|
+| 6.5MP | 6.4s | 647MB |
+| 12MP (폰 기본) | 6.8s | 1.0GB |
+| 24MP | 8.1s | 1.7GB |
+| 40MP | 8.9s | 2.5GB |
+
+메모리는 **메가픽셀당 약 63MB**로 선형 증가합니다(내부 연산이 float64). 그래서
+`SKIN_METRICS_API_ANALYSIS_MAX_PIXELS`(기본 **16MP**)를 넘는 이미지는 **거절하지 않고
+분석 직전에 축소**합니다 — 요청 1건이 약 1.2GB, 동시 2건이 2.5GB로 묶여 compose의
+`memory: 4g` 안에 들어옵니다. 이 예산이 없으면 40MP 사진 2장이 동시에 들어올 때
+**5GB를 써서 컨테이너가 OOM으로 죽습니다**.
+
+축소해도 정확도 손실은 없습니다. 파이프라인이 어차피 모든 얼굴을
+`normalization.target_eye_span_px`(512px)로 정규화하기 때문입니다. 축소 후 얼굴이 너무
+작아지면 기존 `under_resolved` 경고가 그대로 동작해 수분 신뢰도를 낮춥니다.
+
+#### 5. 해커톤 배포 시 반드시 알 것
+
+- **인증·레이트리밋이 없습니다.** 퍼블릭 IP에 그대로 열면 누구나 호출할 수 있고,
+  요청 1건이 CPU를 수 초씩 점유합니다. 데모 기간엔 **보안 그룹의 소스 IP를 팀/심사장
+  대역으로 제한**하는 게 가장 간단한 방어입니다.
+- **HTTPS가 아닙니다.** 프론트엔드가 HTTPS면 브라우저가 mixed content로 차단합니다.
+  Caddy/nginx 리버스 프록시 + Let's Encrypt를 앞에 두거나, 프론트도 HTTP로 띄우세요.
+- `SKIN_METRICS_API_ALLOW_PRIVATE_HOSTS`는 **절대 켜지 마세요.** EC2에서 켜면
+  `169.254.169.254`(인스턴스 메타데이터 = IAM 자격증명)로 요청을 보낼 수 있게 됩니다.
+  기본값 `0` 그대로 두면 막힙니다.
+
 ### 운영 시 확인할 것
 
-- `docker-compose.yml`은 **127.0.0.1 에만 바인딩**합니다. `/analyze` 앞에 인증·레이트리밋이
-  없으므로, 외부에 열려면 리버스 프록시에서 인증·요청 제한을 반드시 두세요.
+- `docker-compose.yml`은 기본적으로 **127.0.0.1 에만 바인딩**합니다(`SKIN_METRICS_BIND`로
+  변경). `/analyze` 앞에 인증·레이트리밋이 없으므로, 외부에 열려면 리버스 프록시에서
+  인증·요청 제한을 두세요.
 - `SKIN_METRICS_API_ALLOW_PRIVATE_HOSTS=1`은 **개발 전용**입니다. 켜면 컨테이너가
   같은 네트워크의 내부 서비스로 요청을 보낼 수 있게 됩니다(SSRF).
 - 분석은 CPU 바운드입니다. `SKIN_METRICS_API_MAX_CONCURRENCY`와 컨테이너 CPU 한도를

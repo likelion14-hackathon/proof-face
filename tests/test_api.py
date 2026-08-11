@@ -147,6 +147,41 @@ def test_decode_image_rejects_garbage():
     assert exc.value.code == "decode_error"
 
 
+def test_decode_image_downscales_to_the_analysis_budget(synthetic_image):
+    """Over-budget images are resized to fit, not rejected."""
+    budget = 40_000  # 500x500 = 250k px, so this forces a downscale
+    arr = decode_image(
+        _png_bytes(synthetic_image), max_pixels=10_000_000, analysis_max_pixels=budget
+    )
+    assert arr.shape[0] * arr.shape[1] <= budget
+    # Aspect ratio preserved (square in, square out).
+    assert arr.shape[0] == arr.shape[1]
+    assert arr.dtype == np.uint8
+
+
+def test_decode_image_leaves_under_budget_images_untouched(synthetic_image):
+    """No upscaling: a small image must come back at its native size."""
+    arr = decode_image(
+        _png_bytes(synthetic_image), max_pixels=10_000_000, analysis_max_pixels=10_000_000
+    )
+    np.testing.assert_array_equal(arr, synthetic_image)
+
+
+def test_analyze_downscales_instead_of_rejecting_a_big_image(
+    monkeypatch, synthetic_landmarks, image_server
+):
+    """A photo over the analysis budget still scores, rather than returning 413."""
+    monkeypatch.setattr(
+        "skin_metrics.pipeline.detect_landmarks",
+        lambda img, model_path=None: synthetic_landmarks,
+    )
+    settings = ApiSettings(allow_private_hosts=True, analysis_max_pixels=40_000)
+    with TestClient(create_app(settings)) as budgeted:
+        resp = budgeted.post("/analyze", json={"image_url": f"{image_server}/face.png"})
+    assert resp.status_code == 200, resp.text
+    assert 0.0 <= resp.json()["pigmentation"] <= 100.0
+
+
 def test_decode_image_rejects_too_many_pixels(synthetic_image):
     with pytest.raises(ImageFetchError) as exc:
         decode_image(_png_bytes(synthetic_image), max_pixels=100)

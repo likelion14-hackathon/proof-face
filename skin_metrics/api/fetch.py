@@ -128,7 +128,9 @@ def validate_url(url: str, *, allow_private_hosts: bool = False) -> None:
             )
 
 
-def decode_image(data: bytes, *, max_pixels: int) -> np.ndarray:
+def decode_image(
+    data: bytes, *, max_pixels: int, analysis_max_pixels: int | None = None
+) -> np.ndarray:
     """Decode image bytes into an RGB ``uint8`` array.
 
     EXIF orientation is applied, palette/grayscale/alpha inputs are converted to
@@ -140,6 +142,11 @@ def decode_image(data: bytes, *, max_pixels: int) -> np.ndarray:
         Encoded image (JPEG/PNG/WebP/...).
     max_pixels : int
         Reject images whose ``width * height`` exceeds this.
+    analysis_max_pixels : int, optional
+        Downscale (never upscale) the decoded image to fit this budget. Left at
+        ``None`` the image is returned at native size. See
+        :attr:`~skin_metrics.api.settings.ApiSettings.analysis_max_pixels` for
+        why the API sets one.
 
     Returns
     -------
@@ -164,7 +171,13 @@ def decode_image(data: bytes, *, max_pixels: int) -> np.ndarray:
                     status_code=413,
                 )
             im = ImageOps.exif_transpose(im)
-            arr = np.asarray(im.convert("RGB"), dtype=np.uint8)
+            im = im.convert("RGB")
+            # exif_transpose may have swapped the axes, so re-read the size.
+            if analysis_max_pixels is not None and im.width * im.height > analysis_max_pixels:
+                scale = (analysis_max_pixels / (im.width * im.height)) ** 0.5
+                target = (max(1, int(im.width * scale)), max(1, int(im.height * scale)))
+                im = im.resize(target, Image.LANCZOS)
+            arr = np.asarray(im, dtype=np.uint8)
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise ImageFetchError(
             "Could not decode the downloaded bytes as an image.",
@@ -271,7 +284,11 @@ async def fetch_image(url: str, settings: ApiSettings, *, client=None) -> tuple[
         if not data:
             raise ImageFetchError("Image URL returned an empty body.", code="empty_body")
 
-        image = decode_image(data, max_pixels=settings.max_pixels)
+        image = decode_image(
+            data,
+            max_pixels=settings.max_pixels,
+            analysis_max_pixels=settings.analysis_max_pixels,
+        )
         meta = {
             "final_url": final_url,
             "content_type": content_type.split(";")[0].strip() or None,

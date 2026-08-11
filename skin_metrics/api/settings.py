@@ -59,8 +59,16 @@ class ApiSettings:
         Hard cap on downloaded image bytes.
     max_pixels : int
         Hard cap on decoded pixel count (decompression-bomb guard). Images over
-        the cap are rejected rather than resized: resampling would distort the
-        texture-based hydration proxy.
+        this are rejected outright.
+    analysis_max_pixels : int
+        Pixel budget handed to the pipeline. Anything larger is downscaled to
+        fit rather than rejected, because peak memory scales with the decoded
+        size (~63 MB per megapixel: a 40 MP image peaks at 2.5 GB, and
+        ``max_concurrency`` of those at once will OOM a 4 GB host). Resolution
+        above this budget buys no accuracy either -- the pipeline normalises
+        every face to ``normalization.target_eye_span_px`` before extracting
+        features. A face that ends up too small after the downscale is flagged
+        ``under_resolved`` by the pipeline exactly as it would be natively.
     fetch_timeout : float
         Per-request timeout (seconds) for the image download.
     max_redirects : int
@@ -77,6 +85,7 @@ class ApiSettings:
     download_model: bool = False
     max_bytes: int = 20 * 1024 * 1024
     max_pixels: int = 40_000_000
+    analysis_max_pixels: int = 16_000_000
     fetch_timeout: float = 10.0
     max_redirects: int = 3
     allow_private_hosts: bool = False
@@ -97,6 +106,9 @@ class ApiSettings:
             download_model=_env_bool("SKIN_METRICS_API_DOWNLOAD_MODEL", False),
             max_bytes=_env_int("SKIN_METRICS_API_MAX_BYTES", 20 * 1024 * 1024),
             max_pixels=_env_int("SKIN_METRICS_API_MAX_PIXELS", 40_000_000),
+            analysis_max_pixels=max(
+                1, _env_int("SKIN_METRICS_API_ANALYSIS_MAX_PIXELS", 16_000_000)
+            ),
             fetch_timeout=_env_float("SKIN_METRICS_API_FETCH_TIMEOUT", 10.0),
             max_redirects=_env_int("SKIN_METRICS_API_MAX_REDIRECTS", 3),
             allow_private_hosts=_env_bool("SKIN_METRICS_API_ALLOW_PRIVATE_HOSTS", False),
