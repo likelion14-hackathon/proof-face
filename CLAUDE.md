@@ -33,6 +33,9 @@ Spring Boot 백엔드와의 연동을 위해 API가 **비동기**로 바뀌었�
    `error.code`로 전달 — HTTP로는 안 나감.
 5. **Redis 자격증명은 `.env`**(gitignore됨)에만. compose가 `${SKIN_METRICS_REDIS_URL:?}`로
    주입. **저장소에 커밋 금지.** 해커톤 Redis Cloud 인스턴스는 사용자가 보유.
+   클론용 템플릿은 `.env.example`(커밋됨, 값은 전부 자리표시자) — compose가 읽는 4개
+   변수만 들어 있고 나머지 API 설정은 `docker-compose.yml`에 직접 적혀 있습니다.
+   새 변수를 compose의 `${...}`로 추가하면 `.env.example`에도 같이 넣을 것.
 6. **이미지 배포는 GitHub Packages** (`.github/workflows/publish-image.yml`).
    `main` 푸시 시 러너(amd64 네이티브)가 빌드해
    `ghcr.io/likelion14-hackathon/skin-metrics-api:{latest,<sha>}`로 push.

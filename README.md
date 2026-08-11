@@ -588,6 +588,12 @@ Redis는 캐시가 아니라 **결과 전달 경로 자체이므로 필수**입�
 폴백하지 않습니다 — 폴백이 있으면 `.env`를 빠뜨렸을 때 API는 200을 주는데 Spring만 결과를
 못 읽는 상태가 됩니다.
 
+클론 직후에는 `.env.example`을 복사해서 채우면 됩니다:
+
+```bash
+cp .env.example .env   # SKIN_METRICS_REDIS_URL을 실제 값으로 교체
+```
+
 ### `POST /analyze` · `POST /analyze/diary`
 
 요청 본문은 두 엔드포인트가 동일:
@@ -907,7 +913,8 @@ docker run -d --name skin-metrics --restart unless-stopped \
 ```bash
 git clone https://github.com/likelion14-hackathon/proof-face.git
 cd proof-face
-echo 'SKIN_METRICS_REDIS_URL=redis://default:<password>@<redis-host>:<port>/0' > .env
+cp .env.example .env
+$EDITOR .env   # SKIN_METRICS_REDIS_URL을 실제 값으로 (없으면 컨테이너가 안 뜹니다)
 
 # 0.0.0.0 바인딩이 있어야 인스턴스 밖에서 접근됩니다 (기본은 루프백)
 SKIN_METRICS_BIND=0.0.0.0 ./redeploy.sh
