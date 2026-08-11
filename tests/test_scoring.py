@@ -16,13 +16,45 @@ from skin_metrics.scoring.schema import MetricScore, SkinReport
 
 @pytest.fixture
 def config():
+    """The config as shipped, calibration profile included."""
     return load_config()
 
 
-def test_composite_raw_uses_available_weights(config):
-    raw = composite_raw("pigmentation", {"melanin_index": 40.0}, config)
+@pytest.fixture
+def fixed_config():
+    """A config with known anchors and references.
+
+    Tests that assert exact arithmetic use this rather than the shipped
+    config: the shipped anchors and reference grids are refitted from a cohort
+    whenever `skin-metrics calibrate fit` runs, so pinning numbers to them
+    would make an ordinary recalibration look like a regression.
+    """
+    return {
+        "composite": {
+            "pigmentation": {
+                "weights": {"melanin_index": 0.6, "evenness": 0.4},
+                "anchors": {
+                    "melanin_index": {"mean": 40.0, "std": 10.0},
+                    "evenness": {"mean": 4.0, "std": 2.0},
+                },
+            }
+        },
+        "reference": {
+            "pigmentation": {
+                "default": {"mean": 0.0, "std": 1.0},
+                "1": {"mean": -1.0, "std": 1.0},
+                "6": {"mean": 1.0, "std": 1.0},
+            }
+        },
+        "scoring": {"clip_z": 4.0},
+    }
+
+
+def test_composite_raw_uses_available_weights(fixed_config):
+    raw = composite_raw("pigmentation", {"melanin_index": 40.0}, fixed_config)
     assert isinstance(raw, float)
-    # At the anchor mean, z=0 -> composite 0.
+    # At the anchor mean, z=0 -> composite 0, with `evenness` absent its weight
+    # is dropped and the result renormalised over what is available.
     assert raw == pytest.approx(0.0, abs=1e-6)
 
 
@@ -30,18 +62,25 @@ def test_composite_raw_missing_all_features(config):
     assert composite_raw("erythema", {}, config) == 0.0
 
 
-def test_score_from_raw_bounds_and_monotonic(config):
-    lo = score_from_raw(-3.0, "pigmentation", 3, config)
-    mid = score_from_raw(0.0, "pigmentation", 3, config)
-    hi = score_from_raw(3.0, "pigmentation", 3, config)
+def test_score_from_raw_bounds_and_monotonic(fixed_config):
+    lo = score_from_raw(-3.0, "pigmentation", 3, fixed_config)
+    mid = score_from_raw(0.0, "pigmentation", 3, fixed_config)
+    hi = score_from_raw(3.0, "pigmentation", 3, fixed_config)
     assert 0.0 <= lo < mid < hi <= 100.0
     assert mid == pytest.approx(50.0, abs=1.0)
 
 
-def test_score_metric_fitzpatrick_reference_differs(config):
-    feats = {"melanin_index": 60.0, "spot_area_ratio": 0.05, "evenness": 6.0, "ita_inv": 10.0}
-    s1 = score_metric("pigmentation", feats, 1, config)
-    s6 = score_metric("pigmentation", feats, 6, config)
+def test_shipped_config_scores_stay_in_range(config):
+    """Whatever the current calibration is, scores must stay bounded."""
+    for metric in ("pigmentation", "erythema", "hydration"):
+        for raw in (-1e6, -1.0, 0.0, 1.0, 1e6):
+            assert 0.0 <= score_from_raw(raw, metric, 3, config) <= 100.0
+
+
+def test_score_metric_fitzpatrick_reference_differs(fixed_config):
+    feats = {"melanin_index": 60.0, "evenness": 6.0}
+    s1 = score_metric("pigmentation", feats, 1, fixed_config)
+    s6 = score_metric("pigmentation", feats, 6, fixed_config)
     # Same raw features score differently under type-1 vs type-6 references.
     assert s1 != s6
 

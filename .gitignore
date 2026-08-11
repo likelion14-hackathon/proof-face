@@ -40,6 +40,13 @@ data/*
 report*.json
 *.report.json
 
+# --- Calibration corpus (AI-Hub 028 한국인 피부상태 측정 데이터, ~43GB) ---
+# Redistribution-restricted source data. Only the *fitted* parameters that land
+# in skin_metrics/config.yaml are committed.
+028.한국인 피부상태 측정 데이터/
+한국인 피부상태 측정 데이터/
+calibration_work*/
+
 # --- ML artifacts (Phase 2) ---
 *.pt
 *.pth

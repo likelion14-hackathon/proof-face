@@ -104,6 +104,17 @@ def hemoglobin_map(
            "separation_ok": bool}``.
         On degenerate input (too few / constant pixels) ``separation_ok`` is
         ``False`` and the map is all zeros.
+
+    .. warning::
+       ``hemoglobin_score`` is **not usable as an erythema level**. FastICA
+       centres its input, so the extracted source is zero-mean by construction
+       over the very pixels it was fitted on; across the calibration cohort the
+       score never exceeded 1.5e-12 in magnitude. It is therefore excluded from
+       the erythema composite in ``config.yaml``. The map itself is still
+       meaningful *relatively* (which pixels are more hemoglobin-rich than the
+       ROI average). Getting an absolute level needs the ICA fitted once per
+       face with per-ROI means taken afterwards, or the ICA dropped in favour
+       of projecting optical density onto a measured absorbance direction.
     """
     from sklearn.decomposition import FastICA
 

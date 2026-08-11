@@ -100,9 +100,9 @@ def test_rgb_to_lab_white_is_l100():
 
 def test_calibrate_image_status():
     img = np.full((20, 20, 3), 0.5, dtype=np.float32)
-    # No reference -> grayworld, not reliable.
+    # No reference and no background mask -> no white balance, not reliable.
     res = cal.calibrate_image(img)
-    assert res.status == "grayworld"
+    assert res.status == "none"
     assert res.success is False
 
     # Valid reference -> reference, reliable.
@@ -110,7 +110,45 @@ def test_calibrate_image_status():
     assert res2.status == "reference"
     assert res2.success is True
 
-    # CCM without reference -> grayworld status but reliable (success True).
+    # CCM without reference -> reliable (success True) regardless of WB path.
     res3 = cal.calibrate_image(img, ccm=np.eye(3))
     assert res3.ccm_applied is True
     assert res3.success is True
+
+    # Explicit legacy whole-image gray-world stays available.
+    res4 = cal.calibrate_image(img, fallback="grayworld")
+    assert res4.status == "grayworld"
+
+
+def test_calibrate_image_background_fallback():
+    """Enough background -> gray-world off background pixels; too little -> none."""
+    img = np.full((20, 20, 3), 0.5, dtype=np.float32)
+    background = np.zeros((20, 20), dtype=bool)
+    background[:10] = True  # 50% of the frame
+
+    res = cal.calibrate_image(img, background_mask=background)
+    assert res.status == "grayworld"
+
+    sparse = np.zeros((20, 20), dtype=bool)
+    sparse[:1] = True  # 5% -- below the 15% floor
+    res2 = cal.calibrate_image(img, background_mask=sparse)
+    assert res2.status == "none"
+
+
+def test_grayworld_mask_excludes_skin():
+    """Gains must come from the masked pixels, not the dominant region."""
+    img = np.zeros((10, 10, 3), dtype=np.float32)
+    img[:8] = (0.6, 0.3, 0.2)   # 80% "skin": strongly warm
+    img[8:] = (0.4, 0.4, 0.4)   # 20% neutral background
+    background = np.zeros((10, 10), dtype=bool)
+    background[8:] = True
+
+    balanced, _ = cal.white_balance_grayworld(img, mask=background)
+    # Background is already neutral -> gains ~1 -> skin keeps its warmth.
+    assert balanced[0, 0, 0] > balanced[0, 0, 1] > balanced[0, 0, 2]
+
+    unmasked, _ = cal.white_balance_grayworld(img)
+    # Whole-image gray-world drags the dominant skin tone toward neutral.
+    skin_spread_masked = balanced[0, 0, 0] - balanced[0, 0, 2]
+    skin_spread_unmasked = unmasked[0, 0, 0] - unmasked[0, 0, 2]
+    assert skin_spread_unmasked < skin_spread_masked

@@ -133,17 +133,38 @@ def _apply_channel_gains(img: np.ndarray, gains: np.ndarray) -> np.ndarray:
     return np.clip(out, 0.0, 1.0)
 
 
-def white_balance_grayworld(img: np.ndarray) -> tuple[np.ndarray, bool]:
+def white_balance_grayworld(
+    img: np.ndarray,
+    mask: np.ndarray | None = None,
+    max_sample: int = 200_000,
+) -> tuple[np.ndarray, bool]:
     """Gray-world white balance.
 
     Scales each channel so their means are equal (the gray-world assumption).
     This is a weak fallback: it reports ``success=False`` because it can bias
     scenes with a dominant true color.
 
+    .. warning::
+       **Never estimate the gains over a face-filling portrait.** The gray-world
+       assumption is that the scene averages to neutral; when skin is most of
+       the frame, the estimate is the skin colour itself, so applying it divides
+       skin chromaticity out of the image -- ``a*`` and ``b*`` collapse to ~0
+       and ITA saturates at +/-90 degrees. Pass ``mask`` to restrict the
+       estimate to non-skin (background) pixels.
+
     Parameters
     ----------
     img : numpy.ndarray
         Linear RGB image, float in ``[0, 1]``.
+    mask : numpy.ndarray, optional
+        Boolean ``(H, W)`` mask selecting the pixels the gains are estimated
+        from. Gains are still applied to the whole image. ``None`` uses every
+        pixel (see the warning above).
+    max_sample : int, optional
+        Cap on the number of pixels used for the estimate. A channel mean is
+        already precise to <0.1% at this many samples, and materialising a
+        multi-megapixel boolean selection costs more than the estimate is
+        worth.
 
     Returns
     -------
@@ -153,7 +174,16 @@ def white_balance_grayworld(img: np.ndarray) -> tuple[np.ndarray, bool]:
         Always ``False`` (grayworld is a fallback, not a reliable calibration).
     """
     arr = np.asarray(img, dtype=np.float32)
-    means = arr.reshape(-1, 3).mean(axis=0)
+    flat = arr.reshape(-1, 3)
+    if mask is None:
+        sample = flat[:: max(1, flat.shape[0] // max_sample + 1)]
+    else:
+        idx = np.flatnonzero(np.asarray(mask, dtype=bool).reshape(-1))
+        if idx.size == 0:
+            sample = flat[:: max(1, flat.shape[0] // max_sample + 1)]
+        else:
+            sample = flat[idx[:: max(1, idx.size // max_sample + 1)]]
+    means = sample.mean(axis=0)
     gray = float(means.mean())
     # Guard divide-by-zero on dead channels: gain of 1.0 where mean ~ 0.
     gains = np.where(means > _EPS, gray / np.maximum(means, _EPS), 1.0)
@@ -314,14 +344,29 @@ def calibrate_image(
     img: np.ndarray,
     ref_bbox: tuple[int, int, int, int] | None = None,
     ccm: np.ndarray | None = None,
+    *,
+    fallback: Literal["background", "grayworld", "none"] = "background",
+    background_mask: np.ndarray | None = None,
+    min_background_ratio: float = 0.15,
 ) -> CalibrationResult:
     """Run the full calibration flow and report reliability.
 
     Order: linearize -> (optional CCM) -> white balance. When ``ref_bbox`` is
     given and yields a usable neutral patch, status is ``"reference"`` and
-    ``success=True``; otherwise it falls back to gray-world (status
-    ``"grayworld"``, ``success=False``). If white balance cannot be applied at
-    all, status is ``"none"``.
+    ``success=True``. Otherwise the ``fallback`` decides what happens:
+
+    ``"background"`` (default)
+        Gray-world estimated **only over non-skin pixels** (``background_mask``),
+        which keeps the gray-world assumption defensible. If too little
+        background is available, degrade to ``"none"`` rather than to a
+        face-driven estimate.
+    ``"grayworld"``
+        Legacy whole-image gray-world. Valid for scenes where the face is a
+        small part of the frame; destroys skin chromaticity otherwise (see
+        :func:`white_balance_grayworld`).
+    ``"none"``
+        No white balance -- trust the camera's own auto white balance, which is
+        what the sRGB JPEG already encodes.
 
     Parameters
     ----------
@@ -333,6 +378,14 @@ def calibrate_image(
     ccm : numpy.ndarray, optional
         Pre-estimated ``(3, 3)`` color-correction matrix (see
         :func:`estimate_ccm`) to apply before white balance.
+    fallback : {"background", "grayworld", "none"}, optional
+        Strategy when no usable reference patch is present.
+    background_mask : numpy.ndarray, optional
+        Boolean ``(H, W)`` mask that is ``True`` on non-skin pixels. Required
+        for the ``"background"`` fallback to do anything.
+    min_background_ratio : float, optional
+        Minimum fraction of the frame that must be background for the
+        ``"background"`` fallback to trust its estimate.
 
     Returns
     -------
@@ -359,14 +412,47 @@ def calibrate_image(
                 ccm_applied=ccm_applied,
                 notes=notes,
             )
-        notes.append("Reference patch unusable; fell back to gray-world.")
+        notes.append(f"Reference patch unusable; fell back to '{fallback}'.")
 
-    balanced, _ = white_balance_grayworld(linear)
-    # A CCM alone is a reliable calibration even without a reference patch.
+    if fallback == "grayworld":
+        balanced, _ = white_balance_grayworld(linear)
+        notes.append("Whole-image gray-world white balance (no reference).")
+        return CalibrationResult(
+            image=balanced,
+            status="grayworld",
+            success=ccm_applied,
+            ccm_applied=ccm_applied,
+            notes=notes,
+        )
+
+    if fallback == "background" and background_mask is not None:
+        bg = np.asarray(background_mask, dtype=bool)
+        ratio = float(bg.mean()) if bg.size else 0.0
+        if ratio >= min_background_ratio:
+            balanced, _ = white_balance_grayworld(linear, mask=bg)
+            notes.append(
+                f"Background gray-world white balance ({ratio:.0%} of frame is "
+                "non-skin)."
+            )
+            return CalibrationResult(
+                image=balanced,
+                status="grayworld",
+                success=ccm_applied,
+                ccm_applied=ccm_applied,
+                notes=notes,
+            )
+        notes.append(
+            f"Only {ratio:.0%} of the frame is non-skin (need "
+            f"{min_background_ratio:.0%}); skipped white balance to avoid "
+            "neutralising skin colour."
+        )
+
+    # No white balance: the sRGB input already carries the camera's own AWB.
+    notes.append("No white balance applied; relying on camera AWB.")
     return CalibrationResult(
-        image=balanced,
-        status="grayworld",
+        image=np.asarray(linear, dtype=np.float32),
+        status="none",
         success=ccm_applied,
         ccm_applied=ccm_applied,
-        notes=notes or ["Gray-world white balance (no reference)."],
+        notes=notes,
     )

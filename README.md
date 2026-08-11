@@ -15,6 +15,7 @@
 - [설계 개요](#설계-개요)
 - [Phase 1: 물리 기반 파이프라인 (기술 상세)](#phase-1-물리-기반-파이프라인-기술-상세)
 - [Phase 2: 딥러닝 (기술 상세)](#phase-2-딥러닝-기술-상세)
+- [레퍼런스 보정](#레퍼런스-보정-skin_metricscalibrate)
 - [점수 해석 · 신뢰도 · 보정](#점수-해석--신뢰도--보정)
 - [CLI 레퍼런스](#cli-레퍼런스)
 - [HTTP API](#http-api)
@@ -94,8 +95,12 @@ skin_metrics/
 │   ├── erythema.py          # 홍반 지수, a*, Tsumura 헤모글로빈 ICA
 │   └── hydration_proxy.py   # 광택/GLCM·LBP/스케일링/미세주름 (proxy)
 ├── scoring/
-│   ├── normalize.py         # Fitzpatrick 타입별 백분위 정규화, compare()
-│   └── schema.py            # pydantic SkinReport / MetricScore
+│   ├── normalize.py         # 경험적 분위수 백분위, 지도학습 예측 적용, compare()
+│   └── schema.py            # pydantic SkinReport / MetricScore / FaceScale
+├── calibrate/               # 오프라인 보정 (런타임에서 import 안 됨)
+│   ├── aihub.py             # AI-Hub 028 코퍼스 인덱싱 (이미지 ↔ 실측 라벨 조인)
+│   ├── extract.py           # 멀티프로세스·재개가능 특징 추출 → CSV
+│   └── fit.py               # anchor/릿지/분위수 격자 피팅 + 채택 게이트
 ├── models/                  # Phase 2: dataset(+dummy) / network / train
 ├── api/                     # HTTP API (FastAPI)
 │   ├── app.py               # /healthz, /analyze 엔드포인트 + lifespan
@@ -103,9 +108,10 @@ skin_metrics/
 │   ├── schemas.py           # 요청/응답 pydantic 모델
 │   └── settings.py          # SKIN_METRICS_API_* 환경변수 설정
 ├── pipeline.py              # image -> SkinReport 오케스트레이션
-├── config.py / config.yaml  # 설정 로더 / 임계값·레퍼런스 분포
-└── cli.py                   # typer: analyze / compare / train / serve
-tests/                       # 합성 이미지·랜드마크 기반 단위 테스트 (81개)
+├── config.py / config.yaml  # 설정 로더(2파일 병합) / 사람이 관리하는 임계값·정책
+├── calibration_profile.yaml # 생성 파일: 피팅된 anchor·레퍼런스·지도학습 계수
+└── cli.py                   # typer: analyze / compare / train / serve / calibrate
+tests/                       # 합성 이미지·랜드마크·테이블 기반 단위 테스트
 Dockerfile                   # 멀티스테이지: api(기본) / full(Phase 2 포함)
 docker-compose.yml           # 로컬 실행 + trainer 프로파일
 .dockerignore                # deny-all + allow-list (로컬 사진·리포트 유출 차단)
@@ -121,7 +127,7 @@ docker-compose.yml           # 로컬 실행 + trainer 프로파일
 |---|---|
 | `linearize_srgb(img)` | sRGB EOTF 역변환(감마 제거). `s≤0.04045 ? s/12.92 : ((s+0.055)/1.055)^2.4` |
 | `encode_srgb(lin)` | 역변환(선형→sRGB). 왕복 오차 < 1e-4 |
-| `white_balance_grayworld(img)` | 채널 평균을 회색으로 정규화. **약한 fallback → `success=False`** |
+| `white_balance_grayworld(img, mask)` | 채널 평균을 회색으로 정규화. `mask`로 게인 추정에 쓸 픽셀 제한. **약한 fallback → `success=False`** |
 | `white_balance_from_reference(img, bbox)` | 프레임 내 중립 패치(그레이카드/흰 종이) 평균으로 채널 게인 산출. 너무 어둡/클리핑 시 거부 |
 | `estimate_ccm(detected, reference)` | 24패치 컬러체커 → **최소제곱 3×3 색보정 행렬**. `M = lstsq(detected, reference)`, RMS 잔차 반환 |
 | `apply_ccm(img, M)` | `rgb @ M` 적용 |
@@ -129,10 +135,56 @@ docker-compose.yml           # 로컬 실행 + trainer 프로파일
 | `calibrate_image(...)` | 오케스트레이션: 선형화 → (CCM) → WB. `status ∈ {reference, grayworld, none}` 와 `success` 반환 |
 
 - **보정 신뢰도 규약**: `reference`(중립 패치 성공) 또는 CCM 적용 시 `success=True`,
-  grayworld만이면 `False`. 이 값이 downstream `confidence`를 낮춥니다.
-- **배경 영향**: grayworld는 이미지 전체 평균을 쓰므로 강한 색 배경에 영향을 받습니다.
-  지표 계산 자체는 ROI 내부만 쓰므로 배경 무관. 정확도의 핵심 레버는 **그레이카드
-  `--reference-bbox`** 또는 컬러체커 CCM입니다.
+  그 외에는 `False`. 이 값이 downstream `confidence`를 낮춥니다.
+
+#### ⚠️ 인물 사진에 gray-world를 쓰면 안 되는 이유
+
+gray-world는 "장면 전체 평균이 무채색"이라는 가정입니다. **얼굴이 프레임을 채우면 장면
+평균이 곧 피부색**이므로, 게인을 적용하는 순간 피부의 색도가 나눠져 사라집니다.
+실측 코호트에서 확인된 결과:
+
+| WB 모드 | ROI 평균 a* | ROI 중앙값 b* | ITA |
+|---|---|---|---|
+| `grayworld` (구 기본값) | **0.5** | **-1.2** | **93°** (±90에서 포화) |
+| `none` (카메라 AWB) | 15.9 | 26.6 | 39.8° |
+
+a*(홍조)와 b*(황색)가 0으로 붕괴하면 ITA = `atan2(L*-50, b*)`가 ±90°로 포화하고
+**부호가 무작위로 뒤집힙니다**. 코호트 90명 기준, 전문가 색소 등급과의 상관은:
+
+| `calibration.fallback` | spearman(-ITA, 등급) | ITA 평균±sd | Fitzpatrick 분포 (타입 1~6) |
+|---|---|---|---|
+| `none` (**현재 기본값**) | **+0.437** | 31.8 ± 6.4 | [0, 0, 55, 35, 0, 0] |
+| `background` | +0.367 | 38.6 ± 10.4 | [4, 13, 54, 19, 0, 0] |
+| `grayworld` | **-0.307** | 6.5 ± **83.1** | [16, 3, 32, 10, 28, 1] |
+
+gray-world는 노이즈를 더하는 정도가 아니라 **색소 신호를 뒤집습니다**.
+기본 fallback은 `none`(카메라 AWB 신뢰)이며, 한국인 코호트에서 유일하게 타당한
+Fitzpatrick 분포(타입 3~4)를 냅니다. 카메라 AWB가 감당 못 하는 강한 색 조명 환경이면
+`calibration.fallback: background`(비피부 픽셀만으로 gray-world 추정)를 쓰세요.
+
+- **정확도의 핵심 레버**는 여전히 **그레이카드 `--reference-bbox`** 또는 컬러체커 CCM입니다.
+- **배경 영향**: 지표 계산은 ROI 내부만 쓰므로 배경 누끼는 불필요합니다.
+
+### 1-b. 얼굴 크기 정규화 — `pipeline._normalize_face_scale`
+
+GLCM·LBP·미세주름 밀도는 **고정 픽셀 오프셋**에서 계산되므로, 얼굴이 차지하는 픽셀 수가
+다르면 값을 비교할 수 없습니다. 코호트 기기별 눈 사이 거리(외안각):
+
+| 기기 | 평균 eye-span | 해상도 |
+|---|---|---|
+| 디지털카메라 | 1140 px | 2136×3216 |
+| 스마트패드 | 972 px | 2448×3264 |
+| 스마트폰 | 889 px (중앙값) | 1920×2560 |
+
+파이프라인은 특징 추출 전에 얼굴을 **eye-span 512px**로 맞춥니다
+(`normalization.target_eye_span_px`).
+
+- **다운스케일 전용**: 더 작은 얼굴은 그대로 둡니다. 업샘플링은 없는 디테일을 만들어내지
+  않으면서 텍스처만 매끄럽게 만들어 **거짓으로 촉촉하게** 보이게 하기 때문입니다.
+  대신 `under_resolved` 플래그가 서고, 경고가 붙고, 수분 confidence가 ×0.6 됩니다.
+- **선형 광에서 리샘플**: sRGB 인코딩 상태로 축소하면 감마 곡선을 타고 ROI 평균 색이
+  편향됩니다.
+- 부수 효과로 36MP 이미지 분석이 **약 11초 → 3.6초**로 빨라집니다.
 
 ### 2. 얼굴·ROI 검출 — `detection/face.py`
 
@@ -182,31 +234,52 @@ docker-compose.yml           # 로컬 실행 + trainer 프로파일
 ### 4. 정규화·점수화 — `scoring/`
 
 - **집계**: 파이프라인이 유효 ROI별 지표를 **유효 픽셀 수 가중 평균**으로 얼굴 단위 집계.
-- **`composite_raw(metric, subfeatures, config)`**: 서브피처를 `config.yaml`의 anchor
-  (mean/std)로 z-score → **가중합**(사용 가능한 가중치로 재정규화).
-- **`score_from_raw(raw, metric, fitz, config)`**: 해당 **Fitzpatrick 타입 레퍼런스 분포**의
-  mean/std로 z → clip → **정규 CDF**로 0~100 백분위. 타입별 분리로 어두운 피부 편향 완화.
+
+점수는 항상 **score driver를 레퍼런스 분포의 백분위로 변환**해 나옵니다. driver를 얻는
+경로가 두 가지입니다:
+
+| 경로 | 조건 | driver |
+|---|---|---|
+| **보정됨** (calibrated) | `supervised.<metric>` 모델 존재 | 릿지 회귀가 예측한 **실측 장비값** (`score_sign`으로 방향 정렬) |
+| 미보정 (fallback) | 모델 없음 | anchor로 z-score한 서브피처의 **가중합** |
+
+- **`predict_instrument(model, roi_features)`**: 모델이 **학습된 ROI에만**
+  적용됩니다(`applies_to_rois`). 코 부위 특징으로 볼 Corneometer 값을 예측하는 건
+  외삽이므로 제외합니다. 얼굴 단위 값은 부위별 예측의 **단순 평균**입니다 —
+  장비가 부위 면적과 무관하게 부위당 1회씩 측정했으므로, 점수를 조회할 레퍼런스 분포도
+  같은 방식으로 만들어야 합니다(면적 가중을 하면 다른 분포에 대고 조회하게 됨).
+- **`score_from_raw(raw, metric, fitz, config)`**: 해당 **Fitzpatrick 타입 레퍼런스**의
+  **경험적 분위수 격자**(0~100, 101점)에서 선형 보간해 백분위 산출. 격자가 없으면
+  기존 정규 CDF로 폴백. 스팟 개수·예측 등급 분포는 눈에 띄게 치우쳐 있어서 가우시안
+  가정은 꼬리를 잘못 배치합니다.
 - **`compare(current, baseline, min_delta)`**: 지표별 변화량·방향·유의 여부(시계열).
 - **출력 스키마 `schema.py`** (pydantic):
 
 ```python
 class MetricScore(BaseModel):
-    score: float       # 0-100 condition index (높을수록 뚜렷)
-    confidence: float  # 0-1
+    score: float                  # 0-100 condition index (높을수록 뚜렷)
+    confidence: float             # 0-1
     raw_features: dict
-    is_estimate: bool  # hydration은 항상 True
+    is_estimate: bool             # hydration은 항상 True
+    calibrated: bool              # 실측 라벨로 학습된 모델이 낸 점수인가
+    predicted_value: float | None # 예측된 실측 장비값 (보정된 경우)
+    predicted_units: str | None   # 예: "grade 0-5"
 
 class SkinReport(BaseModel):
     pigmentation / erythema / hydration: MetricScore
     roi_breakdown: dict            # ROI별 valid_ratio + 지표
     calibration_status: Literal["reference","grayworld","none"]
     fitzpatrick_estimate: int      # 1-6
+    face_scale: FaceScale          # eye_span_px / scale_factor / under_resolved
+    calibration_profile: str | None  # 어떤 코호트로 보정됐는지
     warnings: list[str]
     disclaimer: str                # 의료기기 아님 고지 (자동 포함)
 ```
 
-- **confidence 계산**(`pipeline.py`): `calibration(reference 1.0 / grayworld 0.6 / none 0.3)
-  × (유효 ROI 수 / 5)`. 홍조는 헤모글로빈 분리 실패 시 ×0.7.
+- **confidence 계산**(`pipeline.py`): `calibration(reference 1.0 / grayworld 0.6 / none 0.6)
+  × (유효 ROI 수 / 5)`. 홍조는 헤모글로빈 분리 실패 시 ×0.7, 수분은 `under_resolved`면 ×0.6.
+  `none`은 더 이상 실패 경로가 아니라 **기본 경로**이고 레퍼런스 코호트도 이 조건에서
+  촬영·피팅됐기 때문에 grayworld보다 불리하게 두지 않습니다.
 
 ---
 
@@ -243,15 +316,199 @@ class SkinReport(BaseModel):
 
 ---
 
+## 레퍼런스 보정 (`skin_metrics/calibrate/`)
+
+0~100 점수가 의미를 가지려면 **실제 사람들의 분포**가 필요합니다. 그 분포와 지도학습
+모델은 AI-Hub 공개 데이터셋 **《028. 한국인 피부상태 측정 데이터》**로 피팅했습니다.
+
+| 항목 | 규모 |
+|---|---|
+| 피험자 | 965명 (train 858 / val 107, **피험자 단위로 분리**) |
+| 이미지 | 정면 2,895장 (3기기 × 965명) |
+| ROI 행 | 11,580 (이마·좌우볼·턱) |
+| 실측 라벨 | Corneometer 수분, 전문가 색소/모공/주름 등급, 장비 스팟·모공 개수 |
+
+```bash
+# 1) 코호트 전체에서 물리 특징 추출 (재개 가능, 약 27분 / 6워커)
+skin-metrics calibrate extract --data-root "028. 한국인 피부상태 측정 데이터" --workers 6
+
+# 2) anchor·레퍼런스 분포·지도학습 모델 피팅 → calibration_profile.yaml
+skin-metrics calibrate fit --dry-run     # 검증 수치만 출력
+skin-metrics calibrate fit               # 프로파일 기록
+```
+
+### 설정 파일이 둘인 이유
+
+| 파일 | 성격 |
+|---|---|
+| `config.yaml` | 사람이 관리하는 임계값·정책·**특징 선택** + 그 근거(주석). 기계가 덮어쓰지 않음. 여기 적힌 composite 가중치는 피팅이 채택되지 않았을 때의 fallback |
+| `calibration_profile.yaml` | **생성 파일**. anchor / composite 가중치 / 레퍼런스 분위수 격자 / 지도학습 계수 / 검증 수치 |
+
+`load_config()`가 둘을 병합합니다. 프로파일이 없어도 파이프라인은 그대로 동작합니다
+(미보정 composite 경로).
+
+### 채택 게이트 — 두 종류
+
+**composite 가중치**: 피팅한 가중치가 held-out에서 `config.yaml`의 선언된 가중치보다
+Spearman ≥ +0.05 더 좋을 때만 채택합니다. 현재 색소는 채택(+0.540 → +0.625),
+수분은 기각(+0.241 → +0.235). 수분은 손으로 정한 가중치가 이미 피팅 결과와 동률이라
+게이트가 선언값을 유지합니다.
+
+> ⚠️ 이 게이트는 한동안 **수분을 잘못 기각**하고 있었습니다. `fit_composite_weights`가
+> `COMPOSITE_TARGET_SIGN`을 적용하지 않고 원본 타깃에 회귀해서, sign=-1인 수분에서
+> 항상 부호가 뒤집힌 가중치를 내놨기 때문입니다(pooled -0.208 / 폰 -0.128 /
+> 태블릿 -0.338 / 디지털카메라 -0.365 — 전부 음수였던 게 단서였습니다). 색소는
+> sign=+1이라 우연히 맞아서 드러나지 않았습니다.
+
+**지도학습 모델 (실측 장비값 예측)**: held-out ≥30행, |pearson| ≥ 0.25,
+MAE가 "평균 예측" 대비 ≥5% 개선. 평균값만 예측하는 것과 별 차이 없는 모델이 리포트에
+`수분 62 a.u.` 같은 구체적 숫자를 찍으면, 개인에 대한 정보가 거의 없는데도 있는 것처럼
+보이기 때문입니다.
+
+어느 쪽이든 탈락은 오류가 아닙니다. 해당 항목은 선언된 값 / 코호트 백분위 경로로
+돌아가고, 사유가 프로파일의 `validation` · `validation_weights`에 기록됩니다.
+
+### 이게 실제로 무엇을 고쳤나 (held-out 321명)
+
+보정 전후로 **동일한 held-out 이미지**를 점수화한 분포입니다. 백분위 매핑이 올바르면
+십분위마다 약 32명씩 균등해야 합니다.
+
+| 지표 | 보정 후 | 보정 전 (placeholder anchor/reference) |
+|---|---|---|
+| pigmentation | 평균 48.6 · 십분위 23~41 | 평균 41.3 · 십분위 **0~79** · 10.7~84.4 |
+| erythema | 평균 49.8 · 십분위 21~43 | 평균 **90.3** · **321명 중 215명이 최상위 십분위** |
+| hydration | 평균 48.6 · 십분위 27~37 | 평균 41.6 · **321명 중 288명이 두 십분위에 몰림** · 25.4~53.5 |
+
+보정 전 점수는 **변별력이 거의 없었습니다**. 특히 홍조는 사실상 모두가 "매우 심함"으로
+나왔고, 수분은 25~53의 좁은 구간에 뭉쳐 있었습니다.
+
+### 실측 일치도 — 배포중인 점수가 실제로 얼마나 맞나
+
+**앞의 십분위 표는 분포가 맞다는 뜻이지 순위가 맞다는 뜻이 아닙니다.** 실측과의 순위
+일치도(Spearman)는 별도로 측정해야 합니다. held-out 321명:
+
+| 지표 | 대상 | 최초(placeholder) | 1차 보정 | **현재** |
+|---|---|---|---|---|
+| pigmentation | 전문가 색소 등급 | +0.096 | +0.139 | **+0.422** |
+| pigmentation | 장비 스팟 개수 | +0.168 | +0.208 | **+0.578** |
+| hydration | Corneometer 수분 | -0.028 | +0.048 | **+0.241** |
+| erythema | — | 측정 불가 | 측정 불가 | 측정 불가 |
+
+수분은 held-out **볼 642행** 기준입니다(집계 부위가 볼이므로 거기서 재는 게 맞습니다).
+기기별 +0.274(폰) / +0.253(태블릿) / +0.371(디지털카메라).
+
+기기별로도 일관됩니다 — 등급 기준 디지털카메라 +0.425 / 태블릿 +0.554 / 폰 +0.329
+(재가중 전에는 **-0.011** / +0.313 / +0.481로 기기마다 제각각이었습니다).
+
+#### 색소 composite에서 절대 색상 특징을 뺀 이유
+
+가장 큰 개선은 anchor 재추정이 아니라 **특징 선택**에서 나왔습니다. 장비 스팟 개수와의
+순위 일치도를 기기별로 보면:
+
+| 특징 | 전체 | 디지털카메라 | 태블릿 | 폰 | 기존 가중치 |
+|---|---|---|---|---|---|
+| `spot_count` | **+0.578** | +0.595 | +0.726 | +0.627 | **없었음** |
+| `spot_area_ratio` | +0.434 | +0.329 | +0.495 | +0.592 | 0.30 |
+| `spot_mean_contrast` | +0.362 | +0.574 | +0.380 | +0.244 | 없었음 |
+| `evenness` | +0.247 | +0.356 | +0.358 | +0.486 | 0.20 |
+| `ita` | -0.258 | -0.676 | -0.236 | -0.210 | 0.10 |
+| `melanin_index` | +0.050 | +0.519 | **-0.085** | +0.031 | **0.40** |
+
+**절대 색상(멜라닌·ITA)은 카메라를 넘으면 부호까지 뒤집힙니다** — 카메라별 색 재현과
+센서 노이즈가 절대값을 옮기기 때문입니다. 형태학 특징(반점 개수·면적·대비·균일도)은
+세 기기 모두에서 유지됩니다. 그런데 기존 composite은 **가장 불안정한 `melanin_index`에
+가중치 40%**를 주고 **가장 강한 `spot_count`는 아예 빼놓고** 있었습니다.
+
+형태학 특징만 남기고 가중치를 코호트에서 피팅한 결과가 위 표의 "현재"입니다.
+그레이카드/컬러체커 보정(`--reference-bbox`)을 쓰면 절대 색상이 기기 독립적이 되므로
+그때는 다시 넣을 가치가 있습니다.
+
+> **주의**: 이 때문에 색소 점수의 의미가 "전반적 톤 어두움 포함"에서 **"반점 부담"**으로
+> 좁아졌습니다. 피부가 전반적으로 어두운 것 자체는 더 이상 점수를 올리지 않습니다.
+
+### 지도학습 모델 검증 결과 (held-out, 피험자 분리)
+
+| 지표 | 타깃 | pearson | MAE (vs 평균 예측) | 채택 |
+|---|---|---|---|---|
+| pigmentation | 전문가 색소 등급 0–5 | +0.302 | 0.958 vs 0.981 (+2.4%) | ✗ (5% 미달) |
+| hydration | Corneometer 수분 | +0.173 | 8.783 vs 8.867 (+0.9%) | ✗ (r 0.25 미달) |
+| erythema | — (이 코호트에 실측 장비값 없음) | — | — | 코호트 백분위만 |
+
+둘 다 게이트에서 탈락했고, 세 지표 모두 **코호트 백분위 경로**로 점수가 나옵니다.
+탈락 사유는 `calibration_profile.yaml`의 `validation` 블록에 기록됩니다.
+
+#### 왜 탈락했나 — 기기 종속성
+
+기기별로 따로 피팅하면 색소 모델은 잘 작동합니다. 그런데 **기기를 넘으면 무너집니다**:
+
+| 학습 ↓ / 평가 → | 디지털카메라 | 스마트패드 | 스마트폰 |
+|---|---|---|---|
+| 디지털카메라 | r=+0.600 **+17.4%** | r=+0.317 **-114.8%** | r=+0.125 **-217.4%** |
+| 스마트패드 | r=+0.148 -56.1% | r=+0.488 **+9.6%** | r=+0.213 -7.4% |
+| 스마트폰 | r=+0.353 +2.4% | r=+0.396 -15.4% | r=+0.357 +3.4% |
+| 풀링(전체) | r=+0.453 +3.4% | r=+0.397 +0.8% | r=+0.311 +2.9% |
+
+디지털카메라로 학습한 모델을 폰 사진에 적용하면 **평균만 답하는 것보다 MAE가 217% 나쁩니다**.
+카메라별 색 재현·센서 노이즈가 절대 특징값을 옮기기 때문입니다. 기기를 모르는 입력을 받는
+서비스에서는 지도학습 모델을 쓸 수 없다는 뜻이고, 그래서 기본 프로파일은 풀링 + 모델 없음입니다.
+
+> **촬영 기기가 고정된 배포라면** `skin-metrics calibrate fit --device digital_camera`로
+> 기기 전용 프로파일을 만들어 색소 모델(+17.4%)을 활성화할 수 있습니다.
+> 그 프로파일을 다른 기기 사진에 쓰면 안 됩니다.
+>
+> 기기 간 전이를 되살리는 정공법은 **그레이카드/컬러체커 보정**입니다
+> (`--reference-bbox`). 절대 색값을 기기 독립적으로 만들어 주기 때문입니다.
+
+### 수분력 — 어디까지 왔고 무엇이 한계인가
+
+수분은 **볼(`left_cheek`/`right_cheek`)에서만** 집계합니다. Corneometer는 이마·볼·턱에서
+측정되었고 **코에서는 잰 적이 없는데** 예전에는 코를 포함한 5개 ROI를 전부 평균내고
+있었습니다. 실측상 신호는 볼에만 있습니다 (held-out, 셀당 n=107):
+
+| ROI | 폰 | 태블릿 | 디지털카메라 |
+|---|---|---|---|
+| left_cheek | **+0.284** | **+0.232** | **+0.385** |
+| right_cheek | **+0.253** | +0.088 | **+0.258** |
+| forehead | +0.051 | +0.187 | +0.165 |
+| chin | +0.072 | -0.019 | +0.005 |
+| nose | 장비 측정 부위 아님 (라벨 없음) | | |
+
+특징도 4개에서 2개로 줄였습니다 — `glcm_contrast`(볼에서 -0.002)와 `specular_inv`는
+무상관~역상관인데 가중치 40%를 차지하며 잡음으로 작동했습니다.
+최종 **`scaling_index` 0.75 / `wrinkle_density` 0.25**.
+
+**시도했지만 채택하지 않은 것:**
+
+| 시도 | 결과 | 판단 |
+|---|---|---|
+| 측면 이미지(`--angles L,R`) 추가 | 볼이 1.7배 크게 잡혀 +0.053 → **+0.128** | 실재하는 효과지만 정면 재보정(+0.241)에 못 미침. 사용자에게 추가 촬영을 요구할 가치 없음 |
+| 정규화 해제(원본 해상도) | +0.053 → **+0.003** (전 특징 악화) | 반증. 폰의 노이즈 리덕션·샤프닝이 원본에서 가짜 텍스처로 읽힘 |
+| 지도학습 릿지 | r=+0.173 | 게이트 탈락 |
+
+**여전히 proxy입니다.** Corneometer는 각질층의 **전기 용량**을 재고, RGB 표면 광학에는
+그 신호가 부분적으로만 담깁니다. +0.24는 **약~중간 수준의 순위 상관**이지 수분량 측정이
+아닙니다. `is_estimate=True`와 "not a moisture measurement" 경고는 유지됩니다.
+수분 점수는 **"이 코호트 대비 볼 텍스처가 얼마나 거친가"**로 읽으세요.
+
+---
+
 ## 점수 해석 · 신뢰도 · 보정
 
-각 점수는 0~100 **"condition index"**, **높을수록 해당 상태가 뚜렷**:
+각 점수는 코호트 대비 0~100 백분위입니다.
 
-| 지표 | 높은 점수 | 비고 |
-|---|---|---|
-| pigmentation | 색소침착 많음/짙음 | 물리 측정 |
-| erythema | 홍조 강함 | 물리 측정 |
-| hydration | **더 건조함** | **proxy 추정 (`is_estimate=True`)** |
+| 지표 | 높은 점수 | 방향 | 비고 |
+|---|---|---|---|
+| pigmentation | 색소침착 많음/짙음 | 높을수록 나쁨 | 물리 측정, 실측 일치도 +0.63 |
+| erythema | 홍조 강함 | 높을수록 나쁨 | 물리 측정, **실측 검증 안 됨**(코호트 백분위) |
+| hydration | **더 촉촉함** | **높을수록 좋음** | **proxy 추정 (`is_estimate=True`)**, 실측 일치도 +0.24 |
+
+> ⚠️ **`hydration`만 방향이 반대입니다.** 내부적으로는 세 지표 모두 "condition index"
+> (높을수록 뚜렷)로 계산되고, hydration의 driver·가중치·분위수 격자는 전부 **건조도**
+> 기준입니다. 마지막 단계에서 `scoring.report_inverted`가 백분위를 뒤집습니다 —
+> `hydration`이라는 이름의 필드는 수분을 뜻해야 하기 때문입니다("수분력 85점"이
+> 건조함을 뜻하면 UI가 사용자에게 정반대를 알려주게 됩니다).
+> 뒤집기는 **반드시 마지막에** 하세요. `calibration_profile.yaml`의 검증 수치와
+> `calibrate/fit.py`의 `COMPOSITE_TARGET_SIGN`은 모두 건조도 방향으로 되어 있습니다.
 
 - **`calibration_status`**: `reference` > `grayworld` > `none` 순으로 신뢰도.
   그레이카드/흰 종이를 프레임에 넣고 `--reference-bbox x,y,w,h`로 지정하면 `reference`로 상승.
@@ -263,6 +520,12 @@ class SkinReport(BaseModel):
 ## CLI 레퍼런스
 
 ```bash
+skin-metrics calibrate extract --data-root PATH [--out-dir DIR] [--workers N]
+                               [--devices digital_camera,tablet,phone] [--limit N]
+                               [--no-resume]
+skin-metrics calibrate fit [--features-dir DIR] [--output PATH] [--device NAME]
+                           [--profile-name NAME] [--dry-run]
+
 skin-metrics analyze <image> [--reference-bbox x,y,w,h] [--model PATH]
                              [--download-model] [--output report.json] [--config cfg.yaml]
 skin-metrics compare <img1> <img2> [--reference-bbox ...] [--output ...]
@@ -291,15 +554,17 @@ OpenAPI 문서는 `/docs`, 스키마는 `/openapi.json`.
   "image_url": "https://example.com/face.jpg",   // 필수, http(s)
   "reference_bbox": [10, 10, 40, 40]             // 선택, [x, y, w, h] 중립 패치
 }
-// 응답 200
+// 응답 200 — 0~100 점수 3개만
 {
-  "report":  { /* SkinReport: CLI analyze 의 JSON 과 동일 (disclaimer 포함) */ },
-  "source":  { "url": ..., "final_url": ..., "content_type": "image/jpeg",
-               "bytes": 15222620, "width": 4912, "height": 7360 },
-  "elapsed_ms": 65987.25,
-  "version": "0.1.0"
+  "pigmentation": 54.52,
+  "erythema": 69.24,
+  "hydration": 24.63
 }
 ```
+
+> API는 점수만 돌려줍니다. ROI별 내역·`raw_features`·`confidence`·`fitzpatrick_estimate`·
+> 의료기기 아님 고지가 필요하면 CLI `analyze`(전체 `SkinReport` JSON)를 쓰세요.
+> **고지는 응답에서 빠졌으므로 이 API를 쓰는 클라이언트가 직접 노출해야 합니다.**
 
 ### `GET /healthz`
 
@@ -456,25 +721,35 @@ Docker Hub만 있으면 됩니다(일부 네트워크에서 ghcr 익명 pull이 
 ## 테스트
 
 ```bash
-uv run pytest -q          # 81 passed
+uv run pytest -q          # 112 passed
 ```
 
 - **합성 이미지·합성 랜드마크** 기반이라 Phase 1 테스트는 `detection`/`dl` extra 없이 실행.
 - `tests/test_models.py`는 torch 미설치 시, `tests/test_api.py`는 fastapi 미설치 시
   `importorskip`으로 자동 스킵.
 - API 테스트는 루프백 HTTP 서버를 띄워 실제 다운로드 경로까지 태우며 외부 네트워크는 쓰지 않음.
-- 커버리지: 색보정 왕복/CCM 복원/D65 화이트, ITA·멜라닌·홍반 공식·가드,
+- `tests/test_calibrate.py`는 **합성 테이블·합성 코퍼스**로 돌아가므로 43GB 데이터셋 없이
+  실행됩니다.
+- 커버리지: 색보정 왕복/CCM 복원/D65 화이트/마스크 기반 gray-world, ITA·멜라닌·홍반 공식·가드,
   헤모글로빈 ICA(정상/퇴화), 텍스처·주름 프록시, ROI 기하·마스킹, 정규화·스키마,
-  end-to-end 파이프라인, Phase 2 forward/GRL/학습 루프(regression·ranking).
+  end-to-end 파이프라인, 보정 툴링(코퍼스 인덱싱·릿지 왕복·채택 게이트·분위수 매핑·프로파일 병합),
+  Phase 2 forward/GRL/학습 루프(regression·ranking).
 
 ---
 
 ## 알려진 한계 · TODO
 
-- **레퍼런스 분포는 placeholder**: `config.yaml`의 `reference.*` / `composite.*` anchor는
-  문헌에 느슨히 근거한 초기값. **대상 카메라·집단 데이터로 재추정 필요**(파일 내 `TODO`).
-  → 절대 점수보다 **동일 조건 시계열 `compare`** 가 더 신뢰 가능.
-- **Phase 2 절대값**: 실측 라벨 없이는 무의미. 라벨 CSV 확보 시 `--data`로 전환.
-- **Tsumura 기준 벡터**(`erythema._HEMOGLOBIN_DIR/_MELANIN_DIR`)도 근사값 → 카메라별
-  측정 흡광 스펙트럼으로 교체 권장(`TODO`).
-- **수분력은 원리상 프록시**: RGB로 직접 측정 불가. 절대 수분값이 필요하면 접촉식 장비 + Phase 2.
+- **레퍼런스 코호트가 한국인 성인 위주**: `calibration_profile.yaml`은 AI-Hub 028
+  코호트(대부분 타입 3~4)로 피팅됐습니다. 타입 1~2, 5~6 버킷은 표본이 부족해
+  `default` 분포로 폴백합니다. 다른 인구집단이 주 대상이면 그 코호트로 재피팅하세요.
+- **수분은 실측과 거의 무관**: Corneometer(각질층 전기 용량)는 RGB 표면 광학으로
+  예측되지 않습니다(held-out r≈0.18). 지도학습 모델은 채택 게이트에서 탈락했고,
+  수분 점수는 **"코호트 대비 텍스처 거칠기 백분위"**입니다. 절대 수분값이 필요하면
+  접촉식 장비를 쓰세요.
+- **홍조는 실측 검증 안 됨**: 이 코호트에 Mexameter 홍반값이 없습니다. 코호트 백분위로만
+  정규화되어 있어 **상대 비교용**입니다.
+- **Phase 2 절대값**: 실측 라벨 CSV가 이제 존재하지만(`calibrate/aihub.py`), 아직 실학습은
+  돌리지 않았습니다.
+- **Tsumura 기준 벡터**(`erythema._HEMOGLOBIN_DIR/_MELANIN_DIR`)는 근사값이고, FastICA가
+  수렴 실패하는 이미지가 꽤 됩니다 → 카메라별 측정 흡광 스펙트럼으로 교체 권장(`TODO`).
+- **동일 조건 시계열 `compare`** 가 여전히 단일 절대 점수보다 신뢰도가 높습니다.

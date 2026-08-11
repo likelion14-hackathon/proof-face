@@ -192,6 +192,120 @@ def serve(
     uvicorn.run("skin_metrics.api.app:app", host=host, port=port, reload=reload)
 
 
+calibrate_app = typer.Typer(
+    add_completion=False,
+    help="Fit the scoring calibration from a labelled reference cohort.",
+)
+app.add_typer(calibrate_app, name="calibrate")
+
+
+@calibrate_app.command("extract")
+def calibrate_extract(
+    data_root: Path = typer.Option(
+        ...,
+        "--data-root",
+        exists=True,
+        help="AI-Hub '028. 한국인 피부상태 측정 데이터' corpus directory.",
+    ),
+    out_dir: Path = typer.Option(
+        Path("calibration_work"), "--out-dir", help="Where the feature CSVs go."
+    ),
+    workers: int = typer.Option(6, "--workers", help="Process-pool size."),
+    devices: Optional[str] = typer.Option(
+        None,
+        "--devices",
+        help="Comma-separated subset: digital_camera,tablet,phone.",
+    ),
+    angles: str = typer.Option(
+        "F",
+        "--angles",
+        help="Comma-separated capture angles: F (frontal), L/R (phone+tablet "
+        "three-quarter), L15,L30,R15,R30,Ft,Fb (digital camera).",
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", help="Subjects per split/device (smoke runs)."
+    ),
+    config: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        exists=True,
+        help="Alternative config.yaml for the workers (e.g. to sweep "
+        "normalization.target_eye_span_px). Default: the packaged one.",
+    ),
+    no_resume: bool = typer.Option(
+        False, "--no-resume", help="Re-extract images already in the CSVs."
+    ),
+) -> None:
+    """Extract physics features for every labelled image in the corpus.
+
+    Resumable: rerunning picks up where an interrupted run stopped.
+    """
+    from .calibrate.extract import index_and_extract
+
+    device_tuple = tuple(d.strip() for d in devices.split(",")) if devices else None
+    angle_tuple = tuple(a.strip() for a in angles.split(",") if a.strip())
+    stats = index_and_extract(
+        data_root,
+        out_dir,
+        devices=device_tuple,
+        angles=angle_tuple,
+        workers=workers,
+        config_path=config,
+        limit=limit,
+        resume=not no_resume,
+    )
+    typer.echo(
+        f"extracted={stats['done']} skipped={stats['skipped']} "
+        f"failed={stats['failed']} -> {out_dir}"
+    )
+
+
+@calibrate_app.command("fit")
+def calibrate_fit(
+    features_dir: Path = typer.Option(
+        Path("calibration_work"),
+        "--features-dir",
+        exists=True,
+        help="Directory holding features_roi.csv / features_face.csv.",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        help="Profile destination (default: packaged calibration_profile.yaml).",
+    ),
+    device: Optional[str] = typer.Option(
+        None, "--device", help="Fit on one capture device only (default: pooled)."
+    ),
+    profile_name: str = typer.Option(
+        "korean_cohort_2023", "--profile-name", help="Identifier stored in reports."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print validation numbers without writing."
+    ),
+) -> None:
+    """Fit anchors, instrument models, and reference grids; write the profile."""
+    from .calibrate.extract import load_rows
+    from .calibrate.fit import fit_calibration, format_validation, write_profile
+    from .config import DEFAULT_PROFILE_PATH
+
+    roi_rows = load_rows(features_dir / "features_roi.csv")
+    face_rows = load_rows(features_dir / "features_face.csv")
+    # Fit against the base config only: a previously written profile must not
+    # feed back into the anchors it is about to replace.
+    config = load_config(use_profile=False)
+
+    fitted = fit_calibration(roi_rows, face_rows, config, device=device)
+    typer.echo(format_validation(fitted))
+
+    if dry_run:
+        typer.echo("(--dry-run: profile not written)")
+        return
+
+    dest = write_profile(fitted, output or DEFAULT_PROFILE_PATH,
+                         profile_name=profile_name)
+    typer.echo(f"wrote {dest}")
+
+
 @app.callback()
 def _main() -> None:
     """skin-metrics CLI."""

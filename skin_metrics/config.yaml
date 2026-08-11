@@ -12,6 +12,43 @@ disclaimer: >
   This system is not a medical device. Results are cosmetic reference
   information only and must not be used for diagnostic purposes.
 
+# --- white balance (calibration/color.py) ----------------------------------
+# Fallback used when no gray-card `--reference-bbox` is supplied.
+#   none:       no white balance; trust the camera's own AWB (DEFAULT)
+#   background: gray-world estimated over NON-SKIN pixels only
+#   grayworld:  legacy whole-image gray-world. On a face-filling portrait the
+#               scene average IS the skin colour, so applying it divides skin
+#               chromaticity out: a*/b* collapse to ~0 and ITA saturates at
+#               +/-90 degrees. Never use this for portraits.
+#
+# Measured on 90 cohort subjects against the expert pigmentation grade
+# (Spearman of -ITA vs grade; Fitzpatrick histogram over types 1..6):
+#   none        +0.437   ITA 31.8 +/- 6.4    [0, 0, 55, 35, 0, 0]
+#   background  +0.367   ITA 38.6 +/- 10.4   [4, 13, 54, 19, 0, 0]
+#   grayworld   -0.307   ITA  6.5 +/- 83.1   [16, 3, 32, 10, 28, 1]
+# Gray-world does not merely add noise, it inverts the pigmentation signal.
+# `none` also yields the only plausible Fitzpatrick distribution for a Korean
+# cohort (types 3-4 exclusively). Switch to `background` if you shoot under
+# strongly coloured lighting that the camera's AWB does not handle.
+calibration:
+  fallback: none
+  min_background_ratio: 0.15
+  face_dilate_frac: 0.35    # grow the landmark hull by this fraction of face
+                            # width so hair/ears/neck stay out of the estimate
+
+# --- face-scale normalisation (pipeline._normalize_face_scale) -------------
+# Texture features (GLCM/LBP/micro-wrinkle) are computed at fixed pixel
+# offsets, so they only compare across images if the face occupies the same
+# number of pixels. Every face is downscaled to `target_eye_span_px` between
+# the outer eye corners before feature extraction. Downscale only: a smaller
+# face is left alone (upsampling invents no detail and would read as smoother
+# = falsely hydrated) but is flagged `under_resolved`, which warns and lowers
+# the hydration confidence.
+# In the calibration cohort, 86-100% of frontal photos per device clear 512px.
+normalization:
+  enabled: true
+  target_eye_span_px: 512
+
 # --- artifact-masking thresholds (detection/face.py) -----------------------
 masking:
   glare_v_min: 0.92       # HSV V above this (0-1) is candidate specular glare
@@ -32,12 +69,25 @@ hydration_proxy:
   specular_s_max: 0.20
 
 # --- scoring orientation ---------------------------------------------------
-# Each score is a 0-100 "condition index" where HIGHER = MORE pronounced:
-#   pigmentation: more/darker pigmentation
-#   erythema:     more redness
-#   hydration:    DRIER (less hydrated).  NOTE: this is a PROXY, is_estimate=True.
+# REPORTED 0-100 scores:
+#   pigmentation: higher = more/darker pigmentation   (higher = worse)
+#   erythema:     higher = more redness               (higher = worse)
+#   hydration:    higher = MORE MOISTURE              (higher = better)
+#                 NOTE: still a PROXY, is_estimate=True.
+#
+# Internally every metric is computed as a "condition index" (higher = more
+# pronounced), so hydration's driver, its composite weights and its fitted
+# quantile grid all measure DRYNESS. `report_inverted` flips the finished
+# percentile at the very last step for metrics whose public name reads the
+# other way round -- a field called `hydration` has to mean hydration, or a UI
+# showing "수분력 85점" tells the user they are moist when they are dry.
+#
+# Flip at the end, never earlier: the calibration and every validation number
+# in calibration_profile.yaml are expressed in the dryness orientation, and
+# COMPOSITE_TARGET_SIGN in calibrate/fit.py depends on it.
 scoring:
   clip_z: 4.0             # clip z-scores to +/- this before CDF mapping
+  report_inverted: [hydration]
 
 # --- reference distributions per metric, per Fitzpatrick type --------------
 # The pipeline builds one composite raw value per metric (see scoring/normalize.py),
@@ -73,20 +123,64 @@ reference:
 # Sub-feature raw->z uses the population anchors below (also placeholders).
 composite:
   pigmentation:
-    weights: { melanin_index: 0.4, spot_area_ratio: 0.3, evenness: 0.2, ita_inv: 0.1 }
+    # MORPHOLOGICAL features only. `melanin_index` and `ita_inv` were dropped:
+    # absolute colour does not survive a change of camera, so their rank
+    # agreement with the instrument spot count flips sign between devices
+    # (melanin_index: +0.52 on the DSLR, -0.09 on the tablet, +0.03 on the
+    # phone), while spot/texture features hold (spot_count: +0.60 / +0.73 /
+    # +0.63). With `melanin_index` carrying 40% of the weight the composite
+    # inherited that instability and scored +0.208 against the instrument;
+    # on these features it reaches +0.625. See README "레퍼런스 보정".
+    # Reinstating absolute colour needs a gray card / colour-checker
+    # (`--reference-bbox`), which makes it device-independent.
+    #
+    # These weights are a fallback: `calibrate fit` refits them from the cohort
+    # and ships them in calibration_profile.yaml when they measure better on
+    # held-out subjects.
+    weights:
+      spot_count:         0.45
+      spot_area_ratio:    0.20
+      spot_mean_contrast: 0.20
+      evenness:           0.15
     anchors:
-      melanin_index:   { mean: 40.0, std: 12.0 }
-      spot_area_ratio: { mean: 0.03, std: 0.03 }
-      evenness:        { mean: 4.0,  std: 2.0 }
-      ita_inv:         { mean: 0.0,  std: 25.0 }   # ita_inv = -ITA (higher=darker)
+      spot_count:         { mean: 10.0, std: 8.0 }
+      spot_area_ratio:    { mean: 0.02, std: 0.01 }
+      spot_mean_contrast: { mean: 7.5,  std: 2.0 }
+      evenness:           { mean: 6.0,  std: 1.5 }
   erythema:
-    weights: { erythema_index: 0.4, mean_a_star: 0.3, hemoglobin: 0.3 }
+    # `hemoglobin` is deliberately absent. FastICA centres its input, so the
+    # extracted source is zero-mean *by construction* over the ROI it was fitted
+    # on -- measured across the whole cohort, |hemoglobin| never exceeded 1.5e-12.
+    # Carrying it at weight 0.3 diluted the real erythema signal by 30% with a
+    # value that is identically zero. Reinstating it needs the redesign noted in
+    # CLAUDE.md (fit the ICA once per face, then take per-ROI means, or drop ICA
+    # and project onto the reference absorbance direction directly).
+    weights: { erythema_index: 0.57, mean_a_star: 0.43 }
     anchors:
       erythema_index: { mean: 8.0,  std: 6.0 }
       mean_a_star:    { mean: 12.0, std: 4.0 }
-      hemoglobin:     { mean: 0.0,  std: 1.0 }
   hydration:
-    weights: { scaling_index: 0.35, glcm_contrast: 0.25, wrinkle_density: 0.25, specular_inv: 0.15 }
+    # Aggregated over the CHEEKS ONLY. The Corneometer readings this metric is
+    # calibrated against were taken on forehead, cheeks and chin -- never the
+    # nose -- and only the cheeks actually track the instrument. Held-out rank
+    # agreement per ROI (scaling_index+wrinkle_density, n=107 subjects each):
+    #                phone    tablet   digital camera
+    #   left_cheek   +0.284   +0.232   +0.385
+    #   right_cheek  +0.253   +0.088   +0.258
+    #   forehead     +0.051   +0.187   +0.165
+    #   chin         +0.072   -0.019   +0.005
+    #   nose          (never measured by the instrument)
+    # Averaging the weak sites into the face-level value cost roughly half the
+    # signal: phone all-ROIs +0.137 vs cheeks-only +0.176 on the same weights.
+    rois: [left_cheek, right_cheek]
+    # `glcm_contrast` and `specular_inv` are dropped. On the cheeks they are
+    # uncorrelated-to-inverted against the Corneometer (glcm_contrast -0.002 on
+    # phone frontal), so they behaved as noise carried at 40% of the weight.
+    # Held-out cheek agreement: declared 4-feature set +0.176 -> +0.280 here.
+    # NOTE this metric remains a PROXY. +0.28 is a weak-to-moderate ranking, not
+    # a moisture measurement; the Corneometer reads stratum-corneum capacitance,
+    # which has no direct optical counterpart. `is_estimate` stays True.
+    weights: { scaling_index: 0.75, wrinkle_density: 0.25 }
     anchors:
       scaling_index:   { mean: 0.10, std: 0.06 }
       glcm_contrast:   { mean: 50.0, std: 30.0 }

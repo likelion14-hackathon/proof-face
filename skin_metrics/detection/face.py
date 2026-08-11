@@ -48,7 +48,60 @@ EXCLUSION_LANDMARKS: dict[str, list[int]] = {
     ],
 }
 
+# Outer eye corners; their separation is the scale yardstick for the face.
+EYE_CORNER_LANDMARKS: tuple[int, int] = (33, 263)
+
 _EPS = 1e-8
+
+
+def eye_span(landmarks: np.ndarray) -> float:
+    """Distance in pixels between the two outer eye corners.
+
+    A stable, expression-invariant proxy for how large the face is in frame.
+    Texture features (GLCM, LBP, micro-wrinkle density) operate at fixed pixel
+    offsets, so they are only comparable between images taken at the same face
+    scale -- this is what :func:`scale_factor_for` normalises.
+
+    Parameters
+    ----------
+    landmarks : numpy.ndarray
+        ``(468, 2)`` FaceMesh landmarks in pixel coordinates.
+
+    Returns
+    -------
+    float
+        Euclidean distance between landmarks 33 and 263.
+    """
+    left, right = EYE_CORNER_LANDMARKS
+    return float(np.linalg.norm(np.asarray(landmarks[left], dtype=np.float64)
+                                - np.asarray(landmarks[right], dtype=np.float64)))
+
+
+def scale_factor_for(landmarks: np.ndarray, target_eye_span: float) -> float:
+    """Resize factor that brings the face to a canonical scale.
+
+    Downscale-only: a face already smaller than ``target_eye_span`` is left
+    alone rather than upsampled, since interpolation invents no detail and
+    would systematically smooth the texture features (reading as "less dry").
+    Callers should instead lower confidence for such images.
+
+    Parameters
+    ----------
+    landmarks : numpy.ndarray
+        ``(468, 2)`` FaceMesh landmarks in pixel coordinates.
+    target_eye_span : float
+        Desired outer-eye-corner separation in pixels.
+
+    Returns
+    -------
+    float
+        Factor in ``(0, 1]`` to multiply image dimensions by. ``1.0`` means
+        "leave as-is".
+    """
+    span = eye_span(landmarks)
+    if span <= _EPS or target_eye_span <= _EPS:
+        return 1.0
+    return float(min(1.0, target_eye_span / span))
 
 
 @dataclass
@@ -255,6 +308,44 @@ def _polygon_mask(
     mask = np.zeros((h, w), dtype=np.uint8)
     cv2.fillConvexPoly(mask, hull, 1)
     return mask.astype(bool)
+
+
+def face_mask(
+    landmarks: np.ndarray,
+    shape: tuple[int, int],
+    dilate_frac: float = 0.35,
+) -> np.ndarray:
+    """Boolean mask covering the face (and a margin for hair/neck).
+
+    Used to *exclude* skin from illuminant estimation: gray-world gains
+    estimated over a face-filling portrait neutralise skin colour itself (see
+    :func:`skin_metrics.calibration.color.white_balance_grayworld`).
+
+    Parameters
+    ----------
+    landmarks : numpy.ndarray
+        ``(468, 2)`` FaceMesh landmarks in pixel coordinates.
+    shape : tuple of int
+        ``(H, W)`` of the target mask.
+    dilate_frac : float, optional
+        Grow the region by this fraction of its size, so hair, ears, and neck
+        -- which are also not neutral -- stay out of the background estimate.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean ``(H, W)`` mask, ``True`` inside the face region.
+
+    Notes
+    -----
+    The margin is added by pushing the hull vertices out from their centroid,
+    not by a morphological dilation: at these margins the structuring element
+    would be hundreds of pixels across, which costs seconds per image.
+    """
+    pts = np.asarray(landmarks, dtype=np.float64)
+    centroid = pts.mean(axis=0)
+    grown = centroid + (pts - centroid) * (1.0 + float(dilate_frac))
+    return _polygon_mask(grown, list(range(len(grown))), shape)
 
 
 def exclusion_mask(
