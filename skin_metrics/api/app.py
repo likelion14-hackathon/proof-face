@@ -2,13 +2,17 @@
 
 Endpoints
 ---------
-``GET  /healthz``          liveness + whether face detection is actually usable.
-``POST /analyze``          ``{"image_url": ...}`` -> 0-100 ``pigmentation`` / ``erythema`` / ``hydration``.
-``POST /analyze/simple``   same body -> 0-10 ``skin_tone`` / ``dryness`` / ``redness``.
+``GET  /healthz``          liveness + face detection + result-store status.
+``POST /analyze``          submit an image URL -> 202 ``{"request_id", "redis_key"}``.
+``POST /analyze/diary``    same, scored on the 0-10 diary axes.
+``GET  /results/{key}``    read back a stored result document (debugging).
 
-Both responses share the same flat envelope: scores + ``confidence`` +
-``warnings`` + ``elapsed_ms`` + ``version`` + ``disclaimer``. The full
-:class:`~skin_metrics.scoring.schema.SkinReport` is CLI-only.
+The analysis itself is **asynchronous**: a POST validates the URL, returns a
+``request_id`` immediately, and runs fetch + scoring in a background task.
+When it finishes -- success or failure -- the outcome is written to Redis under
+``{request_id}:analyze`` / ``{request_id}:diary`` (see
+:mod:`skin_metrics.api.results` for the document shape), where the consuming
+service (Spring Boot) picks it up directly.
 
 Run it with::
 
@@ -16,14 +20,17 @@ Run it with::
     # or: uvicorn skin_metrics.api.app:app --host 127.0.0.1 --port 8000
 
 Every error response uses the ``{"error": {"code", "message"}}`` envelope.
-The analysis itself is CPU-bound and synchronous, so it runs in a worker thread
-behind a semaphore (``SKIN_METRICS_API_MAX_CONCURRENCY``).
+The scoring is CPU-bound and synchronous, so it runs in a worker thread behind
+a semaphore (``SKIN_METRICS_API_MAX_CONCURRENCY``); queued submissions simply
+wait their turn.
 """
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import time
+import uuid
 from contextlib import asynccontextmanager
 
 import anyio
@@ -36,13 +43,15 @@ from fastapi.responses import JSONResponse
 from .. import DISCLAIMER, __version__
 from ..config import load_config
 from ..pipeline import analyze as run_analyze
-from .fetch import ImageFetchError, fetch_image
+from .fetch import ImageFetchError, fetch_image, validate_url
+from .results import make_store
 from .schemas import (
+    AcceptedResponse,
     AnalyzeRequest,
     AnalyzeResponse,
+    DiaryAnalyzeResponse,
     ErrorResponse,
     HealthResponse,
-    SimpleAnalyzeResponse,
 )
 from .settings import ApiSettings
 
@@ -56,15 +65,16 @@ class AnalysisError(Exception):
         self.code = code
         self.message = message
 
+
 _ERROR_RESPONSES: dict[int | str, dict] = {
-    400: {"model": ErrorResponse, "description": "Invalid URL or undecodable image."},
+    400: {"model": ErrorResponse, "description": "Invalid URL."},
     403: {"model": ErrorResponse, "description": "URL points at a non-public address."},
-    413: {"model": ErrorResponse, "description": "Image exceeds the byte/pixel limit."},
-    422: {"model": ErrorResponse, "description": "No face found, or the image cannot be scored."},
-    502: {"model": ErrorResponse, "description": "Upstream image host failed."},
-    503: {"model": ErrorResponse, "description": "Face detection is unavailable on the server."},
-    504: {"model": ErrorResponse, "description": "Fetching the image timed out."},
+    422: {"model": ErrorResponse, "description": "Request body failed validation."},
+    503: {"model": ErrorResponse, "description": "Result store is unreachable."},
 }
+
+# Maps a metric kind to the response model the background worker stores.
+_RESULT_MODELS = {"analyze": AnalyzeResponse, "diary": DiaryAnalyzeResponse}
 
 
 def _error(status_code: int, code: str, message: str) -> JSONResponse:
@@ -95,13 +105,14 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
     Returns
     -------
     fastapi.FastAPI
-        App with ``/healthz`` and ``/analyze`` mounted.
+        App with ``/healthz``, ``/analyze``, ``/analyze/diary`` and
+        ``/results/{key}`` mounted.
     """
     cfg = settings or ApiSettings.from_env()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        """Load config, resolve the face model, and hold one shared HTTP client."""
+        """Load config, resolve the face model, connect the result store."""
         from ..detection.face import ensure_face_model, resolve_face_model
 
         app.state.config = load_config(cfg.config_path)
@@ -113,34 +124,47 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
             model_path = str(resolved) if resolved is not None else None
         app.state.face_model_path = model_path
         app.state.limiter = anyio.Semaphore(cfg.max_concurrency)
+        app.state.results = make_store(cfg.redis_url, cfg.result_ttl)
+        # Strong references to in-flight background tasks: asyncio only keeps
+        # weak ones, so an unreferenced task can be garbage-collected mid-run.
+        app.state.tasks = set()
         async with httpx.AsyncClient(
             timeout=cfg.fetch_timeout,
             follow_redirects=False,
             headers={"user-agent": f"skin-metrics/{__version__}"},
         ) as client:
             app.state.http = client
-            yield
+            try:
+                yield
+            finally:
+                # Let queued analyses finish writing their results before the
+                # store goes away; cap the wait so shutdown cannot hang.
+                if app.state.tasks:
+                    await asyncio.wait(app.state.tasks, timeout=30)
+                await app.state.results.close()
 
     app = FastAPI(
         title="skin-metrics API",
         version=__version__,
         description=(
             "Pigmentation / erythema / hydration-proxy scoring from a single face "
-            "image URL.\n\n**NOT a medical device.** " + DISCLAIMER
+            "image URL. Submissions are asynchronous: POST returns a request_id "
+            "and the result lands in Redis as {request_id}:analyze / "
+            "{request_id}:diary.\n\n**NOT a medical device.** " + DISCLAIMER
         ),
         lifespan=lifespan,
     )
     app.state.settings = cfg
 
-    async def _run_report(payload: AnalyzeRequest, request: Request):
-        """Fetch the image and score it; shared by both analyze endpoints.
+    async def _run_report(payload: AnalyzeRequest, app: FastAPI):
+        """Fetch the image and score it; runs inside a background task.
 
         Parameters
         ----------
         payload : AnalyzeRequest
             Validated request body.
-        request : fastapi.Request
-            Incoming request (for app state).
+        app : fastapi.FastAPI
+            The application (for config, model path, limiter, HTTP client).
 
         Returns
         -------
@@ -150,11 +174,11 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
         Raises
         ------
         ImageFetchError
-            Propagated from :func:`fetch_image` (handled app-wide).
+            From :func:`fetch_image` (bad host, oversized, undecodable...).
         AnalysisError
             When the pipeline cannot score the image.
         """
-        state = request.app.state
+        state = app.state
         image, _meta = await fetch_image(str(payload.image_url), cfg, client=state.http)
         bbox = tuple(payload.reference_bbox) if payload.reference_bbox else None
 
@@ -177,9 +201,43 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
             raise AnalysisError(503, "detection_unavailable", str(exc)) from exc
         return report
 
+    async def _process(request_id: str, kind: str, payload: AnalyzeRequest) -> None:
+        """Background worker: analyze and store the outcome under its key."""
+        store = app.state.results
+        started = time.perf_counter()
+        try:
+            report = await _run_report(payload, app)
+            elapsed = round((time.perf_counter() - started) * 1000.0, 2)
+            body = _RESULT_MODELS[kind].from_report(report, elapsed_ms=elapsed)
+            await store.finish(request_id, kind, body.model_dump())
+        except (ImageFetchError, AnalysisError) as exc:
+            await store.fail(request_id, kind, exc.code, exc.message)
+        except Exception as exc:  # noqa: BLE001 - must never lose a result
+            await store.fail(request_id, kind, "internal_error", str(exc))
+
+    async def _submit(payload: AnalyzeRequest, request: Request, kind: str) -> JSONResponse:
+        """Accept a submission: validate cheaply, mark processing, spawn work."""
+        # Cheap failures (bad scheme, blocked host) should be synchronous 4xx,
+        # not a "failed" document the consumer has to poll for.
+        validate_url(str(payload.image_url), allow_private_hosts=cfg.allow_private_hosts)
+
+        request_id = uuid.uuid4().hex
+        state = request.app.state
+        try:
+            await state.results.start(request_id, kind)
+        except Exception as exc:  # noqa: BLE001 - store down = can't accept work
+            return _error(503, "result_store_unavailable", str(exc))
+
+        task = asyncio.create_task(_process(request_id, kind, payload))
+        state.tasks.add(task)
+        task.add_done_callback(state.tasks.discard)
+
+        body = AcceptedResponse(request_id=request_id, redis_key=f"{request_id}:{kind}")
+        return JSONResponse(status_code=202, content=body.model_dump())
+
     @app.exception_handler(ImageFetchError)
     async def _fetch_error_handler(request: Request, exc: ImageFetchError):
-        """Map fetch/decode failures onto the error envelope."""
+        """Map fetch/validation failures onto the error envelope."""
         return _error(exc.status_code, exc.code, exc.message)
 
     @app.exception_handler(AnalysisError)
@@ -194,50 +252,61 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
 
     @app.get("/healthz", response_model=HealthResponse, tags=["meta"])
     async def healthz(request: Request) -> HealthResponse:
-        """Report liveness and whether an image URL could actually be analyzed."""
+        """Report liveness, detection readiness, and the result-store state."""
+        store = request.app.state.results
+        if store.backend == "redis":
+            store_status = "redis" if await store.ping() else "redis_unreachable"
+        else:
+            store_status = "memory"
         return HealthResponse(
             face_model_available=request.app.state.face_model_path is not None,
             detection_available=_detection_available(),
+            result_store=store_status,
         )
 
     @app.post(
         "/analyze",
-        response_model=AnalyzeResponse,
+        status_code=202,
+        response_model=AcceptedResponse,
         responses=_ERROR_RESPONSES,
         tags=["analysis"],
     )
     async def analyze(payload: AnalyzeRequest, request: Request):
-        """Fetch ``image_url`` and return its three 0-100 scores.
+        """Submit ``image_url`` for 0-100 scoring.
 
-        The image is downloaded server-side under the SSRF/size limits in
-        :mod:`skin_metrics.api.fetch`, then scored by
-        :func:`skin_metrics.pipeline.analyze` in a worker thread. The full
-        report is flattened to the same envelope shape as ``/analyze/simple``.
+        Returns 202 with a ``request_id`` immediately. The result document
+        (shape: :class:`AnalyzeResponse` inside the store envelope) appears in
+        Redis under ``{request_id}:analyze`` when the analysis completes.
         """
-        started = time.perf_counter()
-        report = await _run_report(payload, request)
-        return AnalyzeResponse.from_report(
-            report, elapsed_ms=round((time.perf_counter() - started) * 1000.0, 2)
-        )
+        return await _submit(payload, request, "analyze")
 
     @app.post(
-        "/analyze/simple",
-        response_model=SimpleAnalyzeResponse,
+        "/analyze/diary",
+        status_code=202,
+        response_model=AcceptedResponse,
         responses=_ERROR_RESPONSES,
         tags=["analysis"],
     )
-    async def analyze_simple(payload: AnalyzeRequest, request: Request):
-        """Fetch ``image_url`` and return three consumer 0-10 scores.
+    async def analyze_diary(payload: AnalyzeRequest, request: Request):
+        """Submit ``image_url`` for the 0-10 diary scores.
 
-        Same fetch/limits/pipeline as ``/analyze``; the full report is then
-        collapsed by :meth:`SimpleAnalyzeResponse.from_report` into
-        ``skin_tone`` / ``dryness`` (당김·건조함) / ``redness``.
+        Same flow as ``/analyze``; the result document (shape:
+        :class:`DiaryAnalyzeResponse` -- ``skin_tone`` / ``dryness`` (당김·건조함)
+        / ``redness``) lands under ``{request_id}:diary``.
         """
-        started = time.perf_counter()
-        report = await _run_report(payload, request)
-        return SimpleAnalyzeResponse.from_report(
-            report, elapsed_ms=round((time.perf_counter() - started) * 1000.0, 2)
-        )
+        return await _submit(payload, request, "diary")
+
+    @app.get("/results/{key}", tags=["analysis"])
+    async def get_result(key: str, request: Request):
+        """Read a stored result document by its full ``{request_id}:{kind}`` key.
+
+        The Spring Boot consumer should read Redis directly; this endpoint
+        exists so a result can be checked with nothing but curl.
+        """
+        doc = await request.app.state.results.get(key)
+        if doc is None:
+            return _error(404, "result_not_found", f"No result under key '{key}'.")
+        return doc
 
     return app
 

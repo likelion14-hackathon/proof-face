@@ -64,10 +64,13 @@ curl -X POST http://127.0.0.1:8000/analyze \
   -H 'content-type: application/json' \
   -d '{"image_url": "https://example.com/face.jpg"}'
 
-# 소비자용 0~10 요약 점수 (피부 톤 / 당김·건조함 / 붉은기)
-curl -X POST http://127.0.0.1:8000/analyze/simple \
+# 다이어리용 0~10 점수 (피부 톤 / 당김·건조함 / 붉은기) — 202 + request_id 반환
+curl -X POST http://127.0.0.1:8000/analyze/diary \
   -H 'content-type: application/json' \
   -d '{"image_url": "https://example.com/face.jpg"}'
+
+# 결과는 Redis {request_id}:diary 에 저장됨. 디버깅은:
+curl http://127.0.0.1:8000/results/<request_id>:diary
 ```
 
 > `uv`는 `~/Library/Python/3.9/bin`에 설치됩니다. PATH에 없으면 전체 경로로 부르거나,
@@ -563,74 +566,123 @@ skin-metrics serve [--host 127.0.0.1] [--port 8000] [--reload] [--download-model
 `api` extra에만 있으며, `skin_metrics.api` 를 import 하지 않는 한 코어 동작에 영향이 없습니다.
 OpenAPI 문서는 `/docs`, 스키마는 `/openapi.json`.
 
-### `POST /analyze`
+### 비동기 흐름 (Spring Boot 연동)
+
+분석은 **비동기**입니다. POST는 `request_id`를 즉시 돌려주고, 분석이 끝나면 결과 JSON이
+**Redis**의 `{request_id}:analyze` / `{request_id}:diary` 키에 저장됩니다. Spring Boot는
+그 키를 Redis에서 직접 읽어갑니다 — 이 API를 다시 부를 필요가 없습니다.
+
+```
+Spring Boot ──POST /analyze──▶ skin-metrics ──202 {"request_id","redis_key"}──▶ Spring Boot
+                                    │ (백그라운드: 이미지 다운로드 → 분석)
+                                    ▼
+                          Redis  SET {request_id}:analyze = {...JSON}  (TTL 1시간)
+                                    ▲
+Spring Boot ────────────── GET {request_id}:analyze ──────────────────┘
+```
+
+Redis 연결은 `SKIN_METRICS_REDIS_URL`(`redis://user:password@host:port/db`)로 설정하며,
+**자격증명이 들어가므로 저장소에 커밋하지 않고** compose 옆의 `.env`(gitignore됨)에 둡니다.
+URL을 설정하지 않으면 프로세스 내부 메모리 스토어로 폴백합니다(개발·테스트 전용 —
+다른 서비스에서는 결과가 보이지 않으며, `/healthz`의 `result_store`가 `"memory"`로 표시됨).
+
+### `POST /analyze` · `POST /analyze/diary`
+
+요청 본문은 두 엔드포인트가 동일:
 
 ```jsonc
-// 요청
 {
   "image_url": "https://example.com/face.jpg",   // 필수, http(s)
   "reference_bbox": [10, 10, 40, 40]             // 선택, [x, y, w, h] 중립 패치
 }
-// 응답 200 — /analyze/simple과 동일한 평평한 형식, 스케일만 0~100
-{
-  "pigmentation": 38.39,   // 높을수록 색소침착 많음
-  "erythema": 55.52,       // 높을수록 붉음
-  "hydration": 70.80,      // 높을수록 촉촉 (proxy)
-  "confidence": { "pigmentation": 0.6, "erythema": 0.6, "hydration": 0.6 },
-  "warnings": [ /* ... */ ],
-  "elapsed_ms": 6900.0,
-  "version": "0.1.0",
-  "disclaimer": "This system is not a medical device. ..."
-}
 ```
 
-> 두 엔드포인트는 **같은 envelope**(점수 + `confidence` + `warnings` + `elapsed_ms` +
-> `version` + `disclaimer`)을 공유합니다. ROI별 내역·`raw_features`·
-> `fitzpatrick_estimate` 등 전체 `SkinReport`가 필요하면 CLI `analyze`를 쓰세요.
-
-### `POST /analyze/simple`
-
-요청 본문·응답 envelope은 `/analyze`와 동일. 점수만 소비자용 **0~10 축 3개**로 바뀝니다.
+응답은 **202** 즉시 반환:
 
 ```jsonc
-// 응답 200
 {
-  "skin_tone": 7.8,      // 피부 톤 밝기: 0=어두움, 10=매우 밝음 (ITA 선형 매핑)
-  "dryness": 2.9,        // 당김·건조함 정도: 0=촉촉, 10=매우 건조 (= (100-hydration)/10)
-  "redness": 5.6,        // 붉은기: 0=없음, 10=강함 (= erythema/10)
-  "confidence": { "skin_tone": 0.6, "dryness": 0.6, "redness": 0.6 },
-  "warnings": [ /* ... */ ],
-  "elapsed_ms": 6900.0,
-  "version": "0.1.0",
-  "disclaimer": "This system is not a medical device. ..."
+  "request_id": "470b634e92bd44b9abeb12accb0f0b70",
+  "redis_key": "470b634e92bd44b9abeb12accb0f0b70:analyze",  // diary면 ...:diary
+  "status": "processing",
+  "version": "0.1.0"
 }
 ```
 
-- **`skin_tone`은 절대 색상 기반(ITA)**이라 세 값 중 유일하게 카메라·조명에 민감합니다.
-  `reference_bbox`(그레이카드)를 주면 기기 독립적이 됩니다. ITA -30°(어두움)~+55°(매우
-  밝음)를 0~10에 선형 매핑, 범위 밖은 클립.
+**Redis에 저장되는 문서** (JSON 문자열, TTL 기본 1시간):
+
+```jsonc
+// 처리 중
+{ "status": "processing", "request_id": "...", "kind": "analyze", "submitted_at": "..." }
+
+// 완료 — /analyze 의 result (0~100)
+{
+  "status": "done", "request_id": "...", "kind": "analyze",
+  "submitted_at": "...", "completed_at": "...",
+  "result": {
+    "pigmentation": 38.39,   // 높을수록 색소침착 많음
+    "erythema": 55.52,       // 높을수록 붉음
+    "hydration": 70.80,      // 높을수록 촉촉 (proxy)
+    "confidence": { "pigmentation": 0.6, "erythema": 0.6, "hydration": 0.6 },
+    "warnings": [ /* ... */ ], "elapsed_ms": 6900.0,
+    "version": "0.1.0", "disclaimer": "..."
+  }
+}
+
+// 완료 — /analyze/diary 의 result (0~10)
+{
+  "status": "done", "kind": "diary", /* ... */
+  "result": {
+    "skin_tone": 7.8,      // 피부 톤 밝기: 0=어두움, 10=매우 밝음 (ITA 선형 매핑)
+    "dryness": 2.9,        // 당김·건조함 정도: 0=촉촉, 10=매우 건조 (= (100-hydration)/10)
+    "redness": 5.6,        // 붉은기: 0=없음, 10=강함 (= erythema/10)
+    "confidence": { /* ... */ }, "warnings": [ /* ... */ ], /* ... */
+  }
+}
+
+// 실패 (다운로드 실패, 얼굴 미검출 등) — 소비자는 이걸로 '아직 처리 중'과 구분
+{
+  "status": "failed", /* ... */
+  "error": { "code": "analysis_failed", "message": "No face detected ..." }
+}
+```
+
+- 두 result는 **같은 envelope**(점수 + `confidence` + `warnings` + `disclaimer`)이고
+  점수 축만 다릅니다(0~100 vs 0~10). 전체 `SkinReport`가 필요하면 CLI `analyze`.
+- **`skin_tone`은 절대 색상 기반(ITA)**이라 카메라·조명에 민감합니다.
+  `reference_bbox`(그레이카드)를 주면 기기 독립적이 됩니다.
 - **`dryness`는 당김·건조함을 하나로** 제공합니다 — 당김은 감각이라 사진에서 분리 측정이
-  불가능하고, 광학적으로는 동일한 건조 신호입니다. hydration proxy와 같은 근거이므로
-  `is_estimate` 성격도 동일합니다.
+  불가능하고, 광학적으로는 동일한 건조 신호입니다.
+
+### `GET /results/{key}`
+
+Redis에 저장된 문서를 그대로 돌려주는 **디버깅용** 엔드포인트입니다
+(`curl localhost:8000/results/470b…:analyze`). Spring Boot는 Redis를 직접 읽는 쪽이
+빠르므로 이 엔드포인트에 의존하지 마세요. 키가 없으면 404 `result_not_found`
+(TTL 만료·오타·아직 시작 전).
 
 ### `GET /healthz`
 
-`status` / `version` / `face_model_available`(모델 파일 존재) / `detection_available`
-(mediapipe import 가능) — 둘 다 `true` 여야 실제 분석이 가능합니다.
+`face_model_available` / `detection_available` — 둘 다 `true`여야 분석 가능.
+`result_store` — `"redis"`(정상) / `"redis_unreachable"`(URL은 있는데 접속 불가) /
+`"memory"`(URL 미설정 — **Spring이 결과를 못 봅니다**). 배포 후 이 값부터 확인하세요.
 
 ### 오류 응답
 
-모든 4xx·5xx는 `{"error": {"code", "message"}}` 형식입니다.
+제출 시점에 판별 가능한 문제만 동기 4xx로 응답하고(아래 표), 다운로드·분석 중의 실패는
+**Redis 문서의 `status: "failed"`** 로 전달됩니다(`error.code`는 같은 코드 체계).
 
 | status | code | 상황 |
 |---|---|---|
-| 400 | `invalid_scheme` / `invalid_url` / `dns_error` / `decode_error` / `empty_body` | URL·응답 본문 문제 |
+| 400 | `invalid_scheme` / `invalid_url` / `dns_error` | URL 자체가 잘못됨 |
 | 403 | `blocked_host` | URL이 사설/루프백/링크로컬 주소로 해석됨 |
-| 413 | `image_too_large` | 바이트 또는 픽셀 상한 초과 |
-| 422 | `invalid_request` / `analysis_failed` | 요청 검증 실패 / 얼굴 미검출·전 ROI 탈락 |
-| 502 | `upstream_error` / `fetch_error` / `too_many_redirects` | 이미지 호스트 실패 |
-| 503 | `face_model_missing` / `detection_unavailable` | 서버에 모델·mediapipe 없음 |
-| 504 | `fetch_timeout` | 다운로드 타임아웃 |
+| 404 | `result_not_found` | `GET /results/{key}` — 키 없음/만료 |
+| 422 | `invalid_request` | 요청 본문 검증 실패 |
+| 503 | `result_store_unavailable` | Redis에 접수 기록조차 못 씀 |
+
+백그라운드 실패로 문서에 기록되는 code: `decode_error` / `empty_body` / `image_too_large` /
+`upstream_error` / `fetch_error` / `fetch_timeout` / `too_many_redirects` /
+`analysis_failed`(얼굴 미검출·전 ROI 탈락) / `face_model_missing` /
+`detection_unavailable` / `internal_error`.
 
 ### 보안 가드 (`api/fetch.py`)
 
@@ -655,6 +707,8 @@ egress 프록시에서 allow-list 하는 편이 낫습니다.
 | `SKIN_METRICS_API_MAX_REDIRECTS` | `3` | 리다이렉트 허용 횟수 |
 | `SKIN_METRICS_API_ALLOW_PRIVATE_HOSTS` | `0` | **개발 전용** — SSRF 가드 해제 |
 | `SKIN_METRICS_API_MAX_CONCURRENCY` | `2` | 동시 분석 수 (파이프라인은 CPU 바운드) |
+| `SKIN_METRICS_REDIS_URL` | (없음) | `redis://user:password@host:port/db`. **`.env`에만** 두고 커밋 금지. 미설정 시 메모리 스토어 폴백 |
+| `SKIN_METRICS_RESULT_TTL` | `3600` | 결과가 Redis에 남아 있는 시간(초) |
 
 > `SKIN_METRICS_BIND`(기본 `127.0.0.1`)과 `SKIN_METRICS_PORT`(기본 `8000`)는 API가 아니라
 > **compose가 읽는 변수**로, 호스트 쪽 바인딩 주소·포트를 정합니다.
@@ -760,9 +814,9 @@ Docker Hub만 있으면 됩니다(일부 네트워크에서 ghcr 익명 pull이 
 
 ### AWS EC2 배포
 
-**빌드는 EC2 인스턴스 위에서 하세요.** 맥에서 만든 이미지를 그대로 올리면 아키텍처가
-어긋납니다(맥 = arm64, 대부분의 EC2 = x86_64 → `exec format error`). 인스턴스에서 빌드하면
-그 인스턴스의 아키텍처로 맞춰지므로 이 문제 자체가 사라지고, 1.7GB를 업로드할 필요도 없습니다.
+⚠️ **아키텍처 주의**: 맥에서 `docker build`로 만든 기본 이미지는 arm64라서 x86_64 EC2에
+올리면 `exec format error`로 죽습니다. 반드시 **`--platform linux/amd64`로 크로스 빌드**한
+이미지(방법 A)를 올리거나, **인스턴스 위에서 빌드**(방법 B)하세요.
 
 #### 1. 인스턴스 선택
 
@@ -794,11 +848,40 @@ docker compose version
 
 > Ubuntu면 `sudo apt install -y docker.io docker-compose-v2 git` 로 대체.
 
-#### 3. 배포
+#### 3-A. 배포 — 이미지 파일 업로드 (권장, 해커톤)
+
+빌드 없이 **이미지 파일 하나만 올리면** 됩니다. 로컬에서 amd64 이미지를 만들어 저장:
+
+```bash
+# 맥에서 (Apple Silicon이어도 amd64로 크로스 빌드됨)
+docker buildx build --platform linux/amd64 --target api \
+  -t skin-metrics-api:0.1.0-amd64 --load .
+docker save skin-metrics-api:0.1.0-amd64 | gzip > skin-metrics-api-0.1.0-amd64.tar.gz
+```
+
+EC2로 올리고 실행:
+
+```bash
+scp -i key.pem skin-metrics-api-0.1.0-amd64.tar.gz ec2-user@<EC2-IP>:~/
+ssh -i key.pem ec2-user@<EC2-IP>
+
+docker load < skin-metrics-api-0.1.0-amd64.tar.gz
+docker run -d --name skin-metrics --restart unless-stopped \
+  -p 0.0.0.0:8000:8000 \
+  -e SKIN_METRICS_REDIS_URL='redis://default:<password>@<redis-host>:<port>/0' \
+  -e SKIN_METRICS_API_ANALYSIS_MAX_PIXELS=16000000 \
+  -e MPLCONFIGDIR=/tmp/mpl \
+  --read-only --tmpfs /tmp:rw,size=64m \
+  --memory 4g --cpus 2 \
+  skin-metrics-api:0.1.0-amd64
+```
+
+#### 3-B. 배포 — 저장소 클론 + 인스턴스에서 빌드
 
 ```bash
 git clone https://github.com/likelion14-hackathon/proof-face.git
 cd proof-face
+echo 'SKIN_METRICS_REDIS_URL=redis://default:<password>@<redis-host>:<port>/0' > .env
 
 # 0.0.0.0 바인딩이 있어야 인스턴스 밖에서 접근됩니다 (기본은 루프백)
 SKIN_METRICS_BIND=0.0.0.0 ./redeploy.sh
@@ -808,13 +891,19 @@ SKIN_METRICS_BIND=0.0.0.0 ./redeploy.sh
 
 ```bash
 curl http://<EC2-퍼블릭-IP>:8000/healthz
-curl -X POST http://<EC2-퍼블릭-IP>:8000/analyze/simple \
+curl -X POST http://<EC2-퍼블릭-IP>:8000/analyze/diary \
   -H 'content-type: application/json' \
   -d '{"image_url":"https://example.com/face.jpg"}'
+# → {"request_id": "...", "redis_key": "...:diary", ...}
+curl http://<EC2-퍼블릭-IP>:8000/results/<request_id>:diary
 ```
 
-재배포는 `git pull && SKIN_METRICS_BIND=0.0.0.0 ./redeploy.sh` 하나면 됩니다.
-`restart: unless-stopped`가 걸려 있어 인스턴스를 재부팅해도 컨테이너가 살아납니다.
+`curl <EC2-IP>:8000/healthz`의 **`result_store`가 `"redis"`인지 꼭 확인**하세요 —
+`"memory"`면 Redis URL이 전달되지 않은 것이고, Spring Boot가 결과를 읽을 수 없습니다.
+
+재배포: 방법 A는 새 tar를 올려 `docker load` 후 컨테이너 재생성, 방법 B는
+`git pull && SKIN_METRICS_BIND=0.0.0.0 ./redeploy.sh`. 두 방법 모두
+`restart: unless-stopped`라 인스턴스를 재부팅해도 컨테이너가 살아납니다.
 
 #### 4. 성능·메모리 (실측)
 
@@ -892,7 +981,7 @@ uv run pytest -q          # 112 passed
 | **홍조** | 실측 라벨이 0장 → 검증 자체가 불가능 | ① 전문의 CEA 등급(0~4) 사진 채점 ② Mexameter/VISIA red 실측 | ①이 최선: **장비 불필요**, 기존 사진 200~300장 + 피부과 전문의 2명. ②는 VISIA 보유 피부과·에스테틱 제휴 |
 | **수분** | 표면 광학의 물리적 한계(+0.32) | 서비스 타깃 폰으로 찍은 정면 사진 + **Corneometer 동시 측정** (볼 좌우, 100명~) | 공개 데이터셋 없음. Corneometer CM825 대여/제휴 측정. AI-Hub에 추가 수분 실측 데이터셋 없음(028이 유일) |
 | **색소** | 지도학습이 기기 종속으로 탈락 | 타깃 폰 **단일 기종**으로 찍은 사진 + 전문가 등급 또는 장비 스팟 개수 | 공개 데이터셋 없음. 028 재활용 가능: `calibrate fit --device phone`(단, 타 기기 입력에 쓰면 안 됨) |
-| **피부 톤** (`/analyze/simple`) | 절대 색상이라 카메라·조명 민감 | 데이터가 아니라 **그레이카드**: 요청에 `reference_bbox` 포함 | 촬영 UI에 그레이카드/흰 종이 가이드 추가 |
+| **피부 톤** (`/analyze/diary`) | 절대 색상이라 카메라·조명 민감 | 데이터가 아니라 **그레이카드**: 요청에 `reference_bbox` 포함 | 촬영 UI에 그레이카드/흰 종이 가이드 추가 |
 | **전 지표 (Phase 2)** | 딥러닝 미학습 | 이미 보유 — 028 라벨 38GB | `calibrate/aihub.py`의 `iter_roi_rows` → `train --data labels.csv --mode regression` |
 
 **공개 데이터셋에 기대지 마세요**: 얼굴 정면 표준 촬영 + 장비 실측이 붙은 공개 데이터는

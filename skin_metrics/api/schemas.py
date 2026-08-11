@@ -63,9 +63,10 @@ class AnalyzeRequest(BaseModel):
 
 
 class AnalyzeResponse(BaseModel):
-    """Body of a successful ``POST /analyze``: the three 0-100 scores.
+    """Result document body for ``POST /analyze``: the three 0-100 scores.
 
-    Same envelope shape as ``POST /analyze/simple`` (flat scores +
+    Stored in Redis under ``{request_id}:analyze`` when the background analysis
+    finishes. Same envelope shape as ``POST /analyze/diary`` (flat scores +
     ``confidence`` + ``warnings`` + ``disclaimer``), just on the 0-100 metric
     scale. Clients needing the full :class:`SkinReport` (ROI breakdown, raw
     features, Fitzpatrick estimate) should use the CLI ``analyze`` command.
@@ -114,8 +115,24 @@ class AnalyzeResponse(BaseModel):
         )
 
 
-class SimpleAnalyzeResponse(BaseModel):
-    """Body of a successful ``POST /analyze/simple``.
+class AcceptedResponse(BaseModel):
+    """Body of a 202 from ``POST /analyze`` / ``POST /analyze/diary``.
+
+    Analysis runs in the background; when it finishes, the outcome is stored
+    under ``redis_key`` (``{request_id}:analyze`` / ``{request_id}:diary``) as
+    a JSON document -- see :mod:`skin_metrics.api.results` for its shape. The
+    consumer (Spring Boot) reads that key straight from Redis; ``GET
+    /results/{key}`` exposes the same document over HTTP for debugging.
+    """
+
+    request_id: str
+    redis_key: str = Field(description='Store key, "{request_id}:{kind}".')
+    status: str = "processing"
+    version: str = __version__
+
+
+class DiaryAnalyzeResponse(BaseModel):
+    """Result document body for ``POST /analyze/diary``.
 
     Three 0-10 consumer-facing scores derived from the full report:
 
@@ -145,7 +162,7 @@ class SimpleAnalyzeResponse(BaseModel):
     disclaimer: str = DISCLAIMER
 
     @classmethod
-    def from_report(cls, report: SkinReport, elapsed_ms: float) -> "SimpleAnalyzeResponse":
+    def from_report(cls, report: SkinReport, elapsed_ms: float) -> "DiaryAnalyzeResponse":
         """Collapse a full :class:`SkinReport` into the three 0-10 scores.
 
         Parameters
@@ -157,7 +174,7 @@ class SimpleAnalyzeResponse(BaseModel):
 
         Returns
         -------
-        SimpleAnalyzeResponse
+        DiaryAnalyzeResponse
             The mapped response.
         """
         ita = report.pigmentation.raw_features.get("ita")
@@ -205,4 +222,12 @@ class HealthResponse(BaseModel):
         description="Whether a MediaPipe FaceLandmarker model file was found."
     )
     detection_available: bool = Field(description="Whether the 'detection' extra is importable.")
+    result_store: str = Field(
+        default="memory",
+        description=(
+            "'redis' (connected), 'redis_unreachable' (configured but down), or "
+            "'memory' (SKIN_METRICS_REDIS_URL not set -- results invisible to "
+            "other services)."
+        ),
+    )
     disclaimer: str = DISCLAIMER

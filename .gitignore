@@ -62,3 +62,7 @@ Thumbs.db
 .vscode/
 *.swp
 *~
+
+# --- secrets (Redis credentials for the API) ---
+.env
+skin-metrics-api-*.tar.gz

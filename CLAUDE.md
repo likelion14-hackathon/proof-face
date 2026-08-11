@@ -12,7 +12,33 @@
 
 ## 현재 상태 (2026-08-11 기준)
 
-### 최신 라운드 (특징 부분집합 탐색 + `/analyze/simple`)
+### 최신 라운드 (Redis 비동기 전환 + `/analyze/diary`)
+
+Spring Boot 백엔드와의 연동을 위해 API가 **비동기**로 바뀌었습니다.
+
+1. **비동기 흐름**: `POST /analyze`·`POST /analyze/diary`는 202 + `request_id`를 즉시
+   반환하고, 백그라운드 태스크가 다운로드→분석 후 결과 JSON을 Redis
+   **`{request_id}:analyze` / `{request_id}:diary`** 키에 저장(TTL 기본 1시간,
+   `SKIN_METRICS_RESULT_TTL`). Spring Boot는 Redis에서 직접 읽음. 문서 스키마
+   (`processing`/`done`/`failed`)는 `api/results.py` docstring 참조.
+   `GET /results/{key}`는 디버깅용 미러.
+2. **`/analyze/simple` → `/analyze/diary` 리네임** (스키마 `DiaryAnalyzeResponse`).
+3. **스토어 이원화** (`api/results.py`): `SKIN_METRICS_REDIS_URL` 설정 시
+   `RedisResultStore`, 미설정 시 `MemoryResultStore`(테스트·로컬 전용 — 다른 프로세스에서
+   안 보임). `/healthz`의 `result_store`(`redis`/`redis_unreachable`/`memory`)로 구분.
+4. **오류 모델 변화**: 제출 시점에 아는 것만 동기 4xx(잘못된 URL, blocked_host, 검증
+   실패, 스토어 다운 503). 다운로드·분석 실패는 저장 문서의 `status: "failed"` +
+   `error.code`로 전달 — HTTP로는 안 나감.
+5. **Redis 자격증명은 `.env`**(gitignore됨)에만. compose가 `${SKIN_METRICS_REDIS_URL:-}`로
+   주입. **저장소에 커밋 금지.** 해커톤 Redis Cloud 인스턴스는 사용자가 보유.
+6. **amd64 이미지**: `docker buildx build --platform linux/amd64 --target api ... --load`
+   → `docker save | gzip` → `skin-metrics-api-0.1.0-amd64.tar.gz`(419MB, gitignore됨).
+   에뮬레이션 기동 + Redis 연결 스모크 통과. EC2 배포 절차는 README "AWS EC2 배포".
+
+검증: 실 Redis Cloud로 E2E(제출→202→백그라운드 분석→Redis 문서 확인, TTL 3600s),
+컨테이너 `/healthz` `result_store: "redis"`, 테스트 137개 통과(메모리 스토어로 폴링).
+
+### 이전 라운드 (특징 부분집합 탐색 + 0~10 점수 API)
 
 1. **수분 +0.241 → +0.320 (held-out 볼 642행)** — 추출은 되고 있었지만 composite 후보에
    든 적이 없는 특징 3개(`glcm_correlation`/`glcm_energy`/`lbp_uniformity`)를 포함해
@@ -149,8 +175,9 @@ Corneometer·전문가 등급 실측)로 보정하면서 **정확도 관련 실�
 - ✅ **Phase 1 완료** — 전 모듈 구현, 단위 테스트 **137개 통과**(API·보정 툴링 포함).
 - ✅ **Phase 2 스캐폴드 완료** — dataset(+더미)/network/train, 더미로 학습 루프 end-to-end 확인.
 - ✅ 실제 이미지 경로(MediaPipe **Tasks API**) 동작하도록 `detect_landmarks` 이중 API 지원.
-- ✅ **HTTP API 완료** (`skin_metrics/api/`, `api` extra) — `POST /analyze`(이미지 URL) /
-  `POST /analyze/simple`(0~10 소비자 점수) / `GET /healthz`. 실제 사진으로 end-to-end 확인.
+- ✅ **HTTP API 완료** (`skin_metrics/api/`, `api` extra) — 비동기 `POST /analyze`(0~100) /
+  `POST /analyze/diary`(0~10) → Redis 결과 저장, `GET /results/{key}` / `GET /healthz`.
+  실제 사진 + 실제 Redis Cloud로 end-to-end 확인.
 - ✅ **Docker 완료** — `Dockerfile`(멀티스테이지, `api`/`full`) · `docker-compose.yml` ·
   deny-all `.dockerignore`. 두 타깃 모두 arm64에서 검증:
   `api`(1.72GB) 빌드→기동→`/analyze`, `full`(2.88GB) `train --dummy` 정상 완료.
@@ -246,12 +273,16 @@ HTTP API (`api` extra):
 ```
 api.app.create_app(settings) → FastAPI          # 모듈 최상단 app = create_app() (uvicorn 타깃)
 ├─ lifespan: load_config / ensure|resolve_face_model / anyio.Semaphore / 공유 httpx.AsyncClient
-├─ GET  /healthz  → face_model_available · detection_available
-├─ POST /analyze         ┐ 공유 _run_report: api.fetch.fetch_image(URL 검증·스트리밍·디코딩)
-└─ POST /analyze/simple  ┘ → anyio.to_thread.run_sync(pipeline.analyze)  # CPU 바운드
-   두 응답 모두 평평한 동일 envelope (점수 + confidence + warnings + disclaimer):
-   /analyze = 0~100 AnalyzeResponse.from_report, /simple = 0~10 SimpleAnalyzeResponse.from_report
-   전체 SkinReport는 CLI 전용
+├─ GET  /healthz  → face_model_available · detection_available · result_store
+├─ POST /analyze        ┐ validate_url(동기 4xx) → 202 {request_id, redis_key}
+├─ POST /analyze/diary  ┘ → asyncio.create_task(_process)
+│     _process: fetch_image → anyio.to_thread.run_sync(pipeline.analyze)  # CPU 바운드
+│               → results.finish/fail → Redis {request_id}:{kind} (TTL)
+│     결과 result는 평평한 동일 envelope (점수 + confidence + warnings + disclaimer):
+│     analyze = 0~100 AnalyzeResponse, diary = 0~10 DiaryAnalyzeResponse
+│     전체 SkinReport는 CLI 전용
+└─ GET  /results/{key}  → 저장 문서 미러 (디버깅용; Spring은 Redis 직접 읽음)
+api.results.make_store → RedisResultStore | MemoryResultStore (URL 미설정 시)
 api.settings.ApiSettings.from_env()  # SKIN_METRICS_API_* (한도·타임아웃·동시성)
 ```
 
@@ -304,10 +335,20 @@ Phase 2: `models.dataset(SkinDataset/DummyLabelGenerator)` → `models.network.S
   부호 있는 합으로 나누면 합이 0 근처일 때 폭발하거나 조용히 0이 됩니다.
   현재 수분 세트의 `glcm_contrast` -0.30 / `lbp_uniformity` -0.25가 실제 예 — 단독으론
   무상관이지만 suppressor로 +0.075를 벌어줍니다. "음수라서" 지우면 안 됩니다.
-- **`/analyze/simple`의 `dryness`는 리포트 방향(높을수록 촉촉) 위에서 한 번 더 뒤집습니다**
+- **`/analyze/diary`의 `dryness`는 리포트 방향(높을수록 촉촉) 위에서 한 번 더 뒤집습니다**
   (`(100-hydration)/10`). `scoring.report_inverted`를 건드리면
-  `SimpleAnalyzeResponse.from_report`와 `tests/test_api.py`의 simple 테스트도 같이 확인.
-  `skin_tone`은 ITA 절대 색상 기반이라 simple 응답에서 유일하게 기기·조명 민감.
+  `DiaryAnalyzeResponse.from_report`와 `tests/test_api.py`의 diary 테스트도 같이 확인.
+  `skin_tone`은 ITA 절대 색상 기반이라 diary 응답에서 유일하게 기기·조명 민감.
+- **API 테스트는 비동기 플로우를 폴링**합니다: `_submit` → `_wait_result`가
+  `GET /results/{key}`를 돌며 `processing`이 끝나길 기다림. TestClient의 portal 루프가
+  별도 스레드에서 돌기 때문에 `time.sleep` 폴링이 동작합니다. 백그라운드 태스크는
+  `app.state.tasks`에 강한 참조로 보관(없으면 GC로 사라질 수 있음).
+- **다운로드·분석 실패는 HTTP로 안 나갑니다** — 저장 문서의 `status:"failed"`로만.
+  제출 시점 검증(스킴·blocked_host·본문)만 동기 4xx. 오류를 추가하면 어느 쪽 경로인지 결정.
+- **`results.finish/fail`은 기존 문서의 `submitted_at`을 보존**(get 후 merge). 새로
+  `_processing()`을 만들어 덮으면 제출 시각이 완료 시각으로 바뀝니다(실제로 그랬음).
+- **Redis 자격증명은 `.env` 전용** — compose가 `${SKIN_METRICS_REDIS_URL:-}`로 주입.
+  코드·compose·README 어디에도 실제 URL을 적지 말 것(공개 저장소).
 - **절대 색상 특징은 기기 간 전이 안 됨**. `melanin_index`/`ita`를 composite에 다시
   넣으려면 그레이카드/컬러체커 보정(`--reference-bbox`)이 전제되어야 합니다.
 - **`calibrate fit`은 `load_config(use_profile=False)`로 읽어야** 합니다. 안 그러면

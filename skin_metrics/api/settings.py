@@ -78,6 +78,12 @@ class ApiSettings:
         disables the SSRF guard.
     max_concurrency : int
         Concurrent analyses; the pipeline is CPU-bound and runs in a thread pool.
+    redis_url : str or None
+        ``redis://user:password@host:port/db`` for the asynchronous result
+        hand-off. Unset selects an in-process store (dev/tests only -- results
+        are then invisible to any other service).
+    result_ttl : int
+        Seconds an analysis result stays readable in the store.
     """
 
     config_path: str | None = None
@@ -90,6 +96,8 @@ class ApiSettings:
     max_redirects: int = 3
     allow_private_hosts: bool = False
     max_concurrency: int = 2
+    redis_url: str | None = None
+    result_ttl: int = 3600
 
     @classmethod
     def from_env(cls) -> "ApiSettings":
@@ -113,4 +121,6 @@ class ApiSettings:
             max_redirects=_env_int("SKIN_METRICS_API_MAX_REDIRECTS", 3),
             allow_private_hosts=_env_bool("SKIN_METRICS_API_ALLOW_PRIVATE_HOSTS", False),
             max_concurrency=max(1, _env_int("SKIN_METRICS_API_MAX_CONCURRENCY", 2)),
+            redis_url=os.environ.get("SKIN_METRICS_REDIS_URL") or None,
+            result_ttl=max(1, _env_int("SKIN_METRICS_RESULT_TTL", 3600)),
         )
