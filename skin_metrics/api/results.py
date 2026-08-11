@@ -39,8 +39,21 @@ def _processing(request_id: str, kind: str) -> dict[str, Any]:
     }
 
 
-def _connect(url: str):
+def _connect(
+    *,
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    db: int,
+    tls: bool,
+):
     """Open an asyncio Redis client.
+
+    The connection is given as separate fields rather than a URL: a password
+    containing ``@``, ``/`` or ``#`` has to be percent-encoded inside a URL,
+    and getting that wrong fails as an authentication error that points
+    nowhere near the real cause.
 
     Deferred import: ``redis`` ships with the ``api`` extra only. Kept as a
     module-level function so tests can substitute a stand-in client and still
@@ -48,8 +61,14 @@ def _connect(url: str):
 
     Parameters
     ----------
-    url : str
-        ``redis://user:password@host:port/db``.
+    host, port : str, int
+        Redis endpoint.
+    username, password : str
+        Credentials; an empty password means the instance takes no auth.
+    db : int
+        Database index.
+    tls : bool
+        Use a TLS connection.
 
     Returns
     -------
@@ -58,8 +77,13 @@ def _connect(url: str):
     """
     import redis.asyncio as aioredis
 
-    return aioredis.from_url(
-        url,
+    return aioredis.Redis(
+        host=host,
+        port=port,
+        username=username or None,
+        password=password or None,
+        db=db,
+        ssl=tls,
         decode_responses=True,
         socket_timeout=5.0,
         socket_connect_timeout=5.0,
@@ -71,15 +95,28 @@ class ResultStore:
 
     Parameters
     ----------
-    url : str
-        ``redis://user:password@host:port/db``.
     ttl : int
         Seconds a stored document stays readable.
+    **connection
+        Connection fields passed straight to :func:`_connect` (``host``,
+        ``port``, ``username``, ``password``, ``db``, ``tls``).
     """
 
-    def __init__(self, url: str, ttl: int) -> None:
+    def __init__(
+        self,
+        *,
+        ttl: int,
+        host: str,
+        port: int = 6379,
+        username: str = "default",
+        password: str = "",
+        db: int = 0,
+        tls: bool = False,
+    ) -> None:
         self.ttl = ttl
-        self._client = _connect(url)
+        self._client = _connect(
+            host=host, port=port, username=username, password=password, db=db, tls=tls
+        )
 
     async def ping(self) -> bool:
         """Return ``True`` when Redis answers."""

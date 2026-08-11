@@ -23,18 +23,21 @@ Spring Boot 백엔드와의 연동을 위해 API가 **비동기**로 바뀌었�
    (`processing`/`done`/`failed`)는 `api/results.py` docstring 참조.
    `GET /results/{key}`는 디버깅용 미러.
 2. **`/analyze/simple` → `/analyze/diary` 리네임** (스키마 `DiaryAnalyzeResponse`).
-3. **Redis 필수** (`api/results.py`의 `ResultStore` 하나뿐): `SKIN_METRICS_REDIS_URL`
+3. **Redis 필수** (`api/results.py`의 `ResultStore` 하나뿐): `SKIN_METRICS_REDIS_HOST`
    미설정이면 lifespan에서 `RuntimeError`로 기동 실패. 메모리 폴백은 **제거**했습니다 —
    `.env`를 빠뜨렸을 때 API는 정상인데 Spring만 결과를 못 읽는 조용한 실패가 났었기 때문.
-   compose도 `${SKIN_METRICS_REDIS_URL:?...}`로 먼저 막습니다.
+   compose도 `${SKIN_METRICS_REDIS_HOST:?...}`로 먼저 막습니다.
    `/healthz`의 `result_store`는 `redis`/`redis_unreachable` 둘 뿐.
+   접속 정보는 **URL 한 줄이 아니라 host/port/user/password/db/tls로 분리**돼 있습니다
+   (`aioredis.Redis(...)` 직접 생성, `from_url` 아님). 비밀번호의 `@`·`/`를 퍼센트
+   인코딩해야 하는 함정을 없애고 Spring 쪽 설정 모양과 맞추기 위함.
 4. **오류 모델 변화**: 제출 시점에 아는 것만 동기 4xx(잘못된 URL, blocked_host, 검증
    실패, 스토어 다운 503). 다운로드·분석 실패는 저장 문서의 `status: "failed"` +
    `error.code`로 전달 — HTTP로는 안 나감.
-5. **Redis 자격증명은 `.env`**(gitignore됨)에만. compose가 `${SKIN_METRICS_REDIS_URL:?}`로
+5. **Redis 자격증명은 `.env`**(gitignore됨)에만. compose가 `${SKIN_METRICS_REDIS_*}`로
    주입. **저장소에 커밋 금지.** 해커톤 Redis Cloud 인스턴스는 사용자가 보유.
-   클론용 템플릿은 `.env.example`(커밋됨, 값은 전부 자리표시자) — compose가 읽는 4개
-   변수만 들어 있고 나머지 API 설정은 `docker-compose.yml`에 직접 적혀 있습니다.
+   클론용 템플릿은 `.env.example`(커밋됨, 값은 전부 자리표시자) — compose가 읽는 변수만
+   들어 있고 나머지 API 설정은 `docker-compose.yml`에 직접 적혀 있습니다.
    새 변수를 compose의 `${...}`로 추가하면 `.env.example`에도 같이 넣을 것.
 6. **이미지 배포는 GitHub Packages** (`.github/workflows/publish-image.yml`).
    `main` 푸시 시 러너(amd64 네이티브)가 빌드해
@@ -372,7 +375,8 @@ Phase 2: `models.dataset(SkinDataset/DummyLabelGenerator)` → `models.network.S
   신뢰도 표현이 필요하면 `confidence`를 쓰세요.
 - **`results.finish/fail`은 기존 문서의 `submitted_at`을 보존**(get 후 merge). 새로
   `_processing()`을 만들어 덮으면 제출 시각이 완료 시각으로 바뀝니다(실제로 그랬음).
-- **Redis 자격증명은 `.env` 전용** — compose가 `${SKIN_METRICS_REDIS_URL:?}`로 주입(미설정 시 즉시 실패).
+- **Redis 자격증명은 `.env` 전용** — compose가 `${SKIN_METRICS_REDIS_*}`로 주입
+  (`HOST` 미설정 시 즉시 실패).
   코드·compose·README 어디에도 실제 URL을 적지 말 것(공개 저장소).
 - **절대 색상 특징은 기기 간 전이 안 됨**. `melanin_index`/`ita`를 composite에 다시
   넣으려면 그레이카드/컬러체커 보정(`--reference-bbox`)이 전제되어야 합니다.

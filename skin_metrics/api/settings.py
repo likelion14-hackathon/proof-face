@@ -78,10 +78,20 @@ class ApiSettings:
         disables the SSRF guard.
     max_concurrency : int
         Concurrent analyses; the pipeline is CPU-bound and runs in a thread pool.
-    redis_url : str
-        ``redis://user:password@host:port/db`` for the asynchronous result
-        hand-off. **Required** -- Redis is where results are delivered, so the
-        app refuses to start with this empty.
+    redis_host : str
+        Redis hostname for the asynchronous result hand-off. **Required** --
+        Redis is where results are delivered, so the app refuses to start with
+        this empty.
+    redis_port : int
+        Redis port.
+    redis_user : str
+        Redis username; ``default`` on a stock Redis Cloud instance.
+    redis_password : str
+        Redis password. Empty means "no auth" (a local unprotected instance).
+    redis_db : int
+        Database index.
+    redis_tls : bool
+        Connect with TLS (``rediss``). Off unless the instance requires it.
     result_ttl : int
         Seconds an analysis result stays readable in the store.
     """
@@ -96,7 +106,12 @@ class ApiSettings:
     max_redirects: int = 3
     allow_private_hosts: bool = False
     max_concurrency: int = 2
-    redis_url: str = ""
+    redis_host: str = ""
+    redis_port: int = 6379
+    redis_user: str = "default"
+    redis_password: str = ""
+    redis_db: int = 0
+    redis_tls: bool = False
     result_ttl: int = 3600
 
     @classmethod
@@ -121,6 +136,11 @@ class ApiSettings:
             max_redirects=_env_int("SKIN_METRICS_API_MAX_REDIRECTS", 3),
             allow_private_hosts=_env_bool("SKIN_METRICS_API_ALLOW_PRIVATE_HOSTS", False),
             max_concurrency=max(1, _env_int("SKIN_METRICS_API_MAX_CONCURRENCY", 2)),
-            redis_url=os.environ.get("SKIN_METRICS_REDIS_URL", "").strip(),
+            redis_host=os.environ.get("SKIN_METRICS_REDIS_HOST", "").strip(),
+            redis_port=_env_int("SKIN_METRICS_REDIS_PORT", 6379),
+            redis_user=os.environ.get("SKIN_METRICS_REDIS_USER", "default").strip(),
+            redis_password=os.environ.get("SKIN_METRICS_REDIS_PASSWORD", ""),
+            redis_db=_env_int("SKIN_METRICS_REDIS_DB", 0),
+            redis_tls=_env_bool("SKIN_METRICS_REDIS_TLS", False),
             result_ttl=max(1, _env_int("SKIN_METRICS_RESULT_TTL", 3600)),
         )

@@ -581,8 +581,10 @@ Spring Boot ──POST /analyze──▶ skin-metrics ──202 {"request_id","r
 Spring Boot ────────────── GET {request_id}:analyze ──────────────────┘
 ```
 
-Redis 연결은 `SKIN_METRICS_REDIS_URL`(`redis://user:password@host:port/db`)로 설정하며,
-**자격증명이 들어가므로 저장소에 커밋하지 않고** compose 옆의 `.env`(gitignore됨)에 둡니다.
+Redis 연결은 `SKIN_METRICS_REDIS_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_DB` / `_TLS`로
+나눠 설정하며(URL 한 줄이 아닌 이유: 비밀번호에 `@`·`/`가 들어가면 퍼센트 인코딩이 필요하고,
+틀리면 원인과 무관한 인증 오류로 나타납니다), **자격증명이 들어가므로 저장소에 커밋하지 않고**
+compose 옆의 `.env`(gitignore됨)에 둡니다.
 Redis는 캐시가 아니라 **결과 전달 경로 자체이므로 필수**입니다. 미설정 시 API는 기동 단계에서
 `RuntimeError`로 즉시 실패하고(`docker compose`는 그 전에 변수 미설정으로 멈춤), 조용히
 폴백하지 않습니다 — 폴백이 있으면 `.env`를 빠뜨렸을 때 API는 200을 주는데 Spring만 결과를
@@ -591,7 +593,7 @@ Redis는 캐시가 아니라 **결과 전달 경로 자체이므로 필수**입�
 클론 직후에는 `.env.example`을 복사해서 채우면 됩니다:
 
 ```bash
-cp .env.example .env   # SKIN_METRICS_REDIS_URL을 실제 값으로 교체
+cp .env.example .env   # Redis host/port/password를 실제 값으로 교체
 ```
 
 ### `POST /analyze` · `POST /analyze/diary`
@@ -719,7 +721,12 @@ egress 프록시에서 allow-list 하는 편이 낫습니다.
 | `SKIN_METRICS_API_MAX_REDIRECTS` | `3` | 리다이렉트 허용 횟수 |
 | `SKIN_METRICS_API_ALLOW_PRIVATE_HOSTS` | `0` | **개발 전용** — SSRF 가드 해제 |
 | `SKIN_METRICS_API_MAX_CONCURRENCY` | `2` | 동시 분석 수 (파이프라인은 CPU 바운드) |
-| `SKIN_METRICS_REDIS_URL` | **필수** | `redis://user:password@host:port/db`. **`.env`에만** 두고 커밋 금지. 미설정 시 기동 실패 |
+| `SKIN_METRICS_REDIS_HOST` | **필수** | Redis 호스트명. 비어 있으면 기동 실패 |
+| `SKIN_METRICS_REDIS_PORT` | `6379` | Redis 포트 (Redis Cloud는 인스턴스별 포트) |
+| `SKIN_METRICS_REDIS_USER` | `default` | Redis 사용자 |
+| `SKIN_METRICS_REDIS_PASSWORD` | (없음) | Redis 비밀번호. **`.env`에만** 두고 커밋 금지 |
+| `SKIN_METRICS_REDIS_DB` | `0` | DB 인덱스 |
+| `SKIN_METRICS_REDIS_TLS` | `0` | TLS(`rediss`) 사용 여부 |
 | `SKIN_METRICS_RESULT_TTL` | `3600` | 결과가 Redis에 남아 있는 시간(초) |
 
 > `SKIN_METRICS_BIND`(기본 `127.0.0.1`)과 `SKIN_METRICS_PORT`(기본 `8000`)는 API가 아니라
@@ -890,7 +897,9 @@ EC2에서 실행:
 docker pull ghcr.io/likelion14-hackathon/skin-metrics-api:latest
 docker run -d --name skin-metrics --restart unless-stopped \
   -p 0.0.0.0:8000:8000 \
-  -e SKIN_METRICS_REDIS_URL='redis://default:<password>@<redis-host>:<port>/0' \
+  -e SKIN_METRICS_REDIS_HOST='<redis-host>' \
+  -e SKIN_METRICS_REDIS_PORT='<port>' \
+  -e SKIN_METRICS_REDIS_PASSWORD='<password>' \
   -e SKIN_METRICS_API_ANALYSIS_MAX_PIXELS=16000000 \
   -e MPLCONFIGDIR=/tmp/mpl \
   --read-only --tmpfs /tmp:rw,size=64m \
@@ -914,7 +923,7 @@ docker run -d --name skin-metrics --restart unless-stopped \
 git clone https://github.com/likelion14-hackathon/proof-face.git
 cd proof-face
 cp .env.example .env
-$EDITOR .env   # SKIN_METRICS_REDIS_URL을 실제 값으로 (없으면 컨테이너가 안 뜹니다)
+$EDITOR .env   # Redis host/port/password를 실제 값으로 (없으면 컨테이너가 안 뜹니다)
 
 # 0.0.0.0 바인딩이 있어야 인스턴스 밖에서 접근됩니다 (기본은 루프백)
 SKIN_METRICS_BIND=0.0.0.0 ./redeploy.sh
@@ -933,7 +942,7 @@ curl http://<EC2-퍼블릭-IP>:8000/results/<request_id>:diary
 
 `curl <EC2-IP>:8000/healthz`의 **`result_store`가 `"redis"`인지 꼭 확인**하세요 —
 `"redis_unreachable"`이면 URL은 전달됐지만 접속이 안 되는 것(방화벽·자격증명·인스턴스 다운)이고,
-컨테이너가 아예 안 뜬다면 `docker logs`에 `SKIN_METRICS_REDIS_URL is not set`이 찍혀 있을 겁니다.
+컨테이너가 아예 안 뜬다면 `docker logs`에 `SKIN_METRICS_REDIS_HOST is not set`이 찍혀 있을 겁니다.
 
 재배포: 방법 A는 새 tar를 올려 `docker load` 후 컨테이너 재생성, 방법 B는
 `git pull && SKIN_METRICS_BIND=0.0.0.0 ./redeploy.sh`. 두 방법 모두

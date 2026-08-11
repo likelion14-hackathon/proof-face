@@ -107,12 +107,12 @@ class _FakeRedis:
 @pytest.fixture(autouse=True)
 def fake_redis(monkeypatch):
     """Redis is mandatory and there is none here: swap the connection only."""
-    monkeypatch.setattr("skin_metrics.api.results._connect", lambda url: _FakeRedis())
+    monkeypatch.setattr("skin_metrics.api.results._connect", lambda **kw: _FakeRedis())
 
 
 def _settings(**overrides) -> ApiSettings:
-    """Test settings: SSRF guard off, plus a URL the fake connection answers."""
-    base = {"allow_private_hosts": True, "redis_url": "redis://fake:6379/0"}
+    """Test settings: SSRF guard off, plus a host the fake connection answers."""
+    base = {"allow_private_hosts": True, "redis_host": "fake-redis"}
     return ApiSettings(**(base | overrides))
 
 
@@ -271,10 +271,10 @@ def test_healthz(client):
     assert "의료기기가 아니" in body["disclaimer"]
 
 
-def test_startup_fails_without_a_redis_url():
-    """Redis is the hand-off, so a missing URL must be loud, not a silent fallback."""
-    with pytest.raises(RuntimeError, match="SKIN_METRICS_REDIS_URL"):
-        with TestClient(create_app(ApiSettings(redis_url=""))):
+def test_startup_fails_without_a_redis_host():
+    """Redis is the hand-off, so a missing host must be loud, not a silent fallback."""
+    with pytest.raises(RuntimeError, match="SKIN_METRICS_REDIS_HOST"):
+        with TestClient(create_app(ApiSettings(redis_host=""))):
             pass
 
 

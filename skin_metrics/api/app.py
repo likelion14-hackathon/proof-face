@@ -116,9 +116,9 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
 
         # Checked first, before any slow startup work: results are handed off
         # through Redis, so without it the API has nowhere to put them.
-        if not cfg.redis_url:
+        if not cfg.redis_host:
             raise RuntimeError(
-                "SKIN_METRICS_REDIS_URL is not set. Analysis results are handed "
+                "SKIN_METRICS_REDIS_HOST is not set. Analysis results are handed "
                 "off through Redis, so the API cannot start without it."
             )
         app.state.config = load_config(cfg.config_path)
@@ -130,7 +130,15 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
             model_path = str(resolved) if resolved is not None else None
         app.state.face_model_path = model_path
         app.state.limiter = anyio.Semaphore(cfg.max_concurrency)
-        app.state.results = ResultStore(cfg.redis_url, cfg.result_ttl)
+        app.state.results = ResultStore(
+            ttl=cfg.result_ttl,
+            host=cfg.redis_host,
+            port=cfg.redis_port,
+            username=cfg.redis_user,
+            password=cfg.redis_password,
+            db=cfg.redis_db,
+            tls=cfg.redis_tls,
+        )
         # Strong references to in-flight background tasks: asyncio only keeps
         # weak ones, so an unreferenced task can be garbage-collected mid-run.
         app.state.tasks = set()
