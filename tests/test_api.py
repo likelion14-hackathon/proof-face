@@ -255,8 +255,8 @@ def test_analyze_stores_flat_scores(client, image_server):
     for metric in ("pigmentation", "erythema", "hydration"):
         assert 0.0 <= result[metric] <= 100.0
         assert 0.0 <= result["confidence"][metric] <= 1.0
-    assert result["disclaimer"]
-    assert result["elapsed_ms"] >= 0.0
+    # Scores only: no warnings / disclaimer / elapsed_ms / version.
+    assert set(result) == {"pigmentation", "erythema", "hydration", "confidence"}
 
 
 def test_analyze_and_diary_share_the_same_envelope(client, image_server):
@@ -300,7 +300,7 @@ def _report_stub(ita=None, hydration=70.0, erythema=35.0) -> SkinReport:
 
 def test_diary_mapping_orients_and_scales_each_score():
     diary = DiaryAnalyzeResponse.from_report(
-        _report_stub(ita=34.5, hydration=70.0, erythema=35.0), elapsed_ms=1.0
+        _report_stub(ita=34.5, hydration=70.0, erythema=35.0)
     )
     # ITA 34.5 sits (34.5+30)/85 of the way from dark to very light.
     assert diary.skin_tone == pytest.approx(round(10.0 * 64.5 / 85.0, 1))
@@ -312,13 +312,13 @@ def test_diary_mapping_orients_and_scales_each_score():
 
 @pytest.mark.parametrize("ita,expected", [(55.0, 10.0), (-30.0, 0.0), (90.0, 10.0), (-80.0, 0.0)])
 def test_diary_mapping_clips_skin_tone_to_0_10(ita, expected):
-    diary = DiaryAnalyzeResponse.from_report(_report_stub(ita=ita), elapsed_ms=1.0)
+    diary = DiaryAnalyzeResponse.from_report(_report_stub(ita=ita))
     assert diary.skin_tone == pytest.approx(expected)
 
 
 def test_diary_mapping_survives_a_missing_ita():
     """No `ita` in raw_features -> Fitzpatrick bucket centre, not a crash."""
-    diary = DiaryAnalyzeResponse.from_report(_report_stub(ita=None), elapsed_ms=1.0)
+    diary = DiaryAnalyzeResponse.from_report(_report_stub(ita=None))
     assert 0.0 <= diary.skin_tone <= 10.0
 
 
@@ -327,7 +327,7 @@ def test_analyze_diary_stores_scores(client, image_server):
     for field in ("skin_tone", "dryness", "redness"):
         assert 0.0 <= result[field] <= 10.0
         assert 0.0 <= result["confidence"][field] <= 1.0
-    assert result["disclaimer"]
+    assert set(result) == {"skin_tone", "dryness", "redness", "confidence"}
 
 
 def test_diary_is_consistent_with_the_full_scores(client, image_server):

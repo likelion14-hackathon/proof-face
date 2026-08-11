@@ -294,7 +294,7 @@ api.app.create_app(settings) → FastAPI          # 모듈 최상단 app = creat
 ├─ POST /analyze/diary  ┘ → asyncio.create_task(_process)
 │     _process: fetch_image → anyio.to_thread.run_sync(pipeline.analyze)  # CPU 바운드
 │               → results.finish/fail → Redis {request_id}:{kind} (TTL)
-│     결과 result는 평평한 동일 envelope (점수 + confidence + warnings + disclaimer):
+│     result = 점수 3개 + confidence 뿐 (warnings·disclaimer·elapsed_ms 없음):
 │     analyze = 0~100 AnalyzeResponse, diary = 0~10 DiaryAnalyzeResponse
 │     전체 SkinReport는 CLI 전용
 └─ GET  /results/{key}  → 저장 문서 미러 (디버깅용; Spring은 Redis 직접 읽음)
@@ -361,6 +361,10 @@ Phase 2: `models.dataset(SkinDataset/DummyLabelGenerator)` → `models.network.S
   `app.state.tasks`에 강한 참조로 보관(없으면 GC로 사라질 수 있음).
 - **다운로드·분석 실패는 HTTP로 안 나갑니다** — 저장 문서의 `status:"failed"`로만.
   제출 시점 검증(스킴·blocked_host·본문)만 동기 4xx. 오류를 추가하면 어느 쪽 경로인지 결정.
+- **API result에는 `warnings`·`disclaimer`가 없습니다** (사용자 요청으로 제거, 점수 +
+  confidence만). 파이프라인은 여전히 생성하며 CLI·`SkinReport`에는 남아 있습니다.
+  "의료기기 아님 고지 유지" 규약은 **소비하는 서비스가 책임집니다** — 여기서 다시 넣지 말 것.
+  신뢰도 표현이 필요하면 `confidence`를 쓰세요.
 - **`results.finish/fail`은 기존 문서의 `submitted_at`을 보존**(get 후 merge). 새로
   `_processing()`을 만들어 덮으면 제출 시각이 완료 시각으로 바뀝니다(실제로 그랬음).
 - **Redis 자격증명은 `.env` 전용** — compose가 `${SKIN_METRICS_REDIS_URL:-}`로 주입.

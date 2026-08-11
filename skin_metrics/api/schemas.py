@@ -66,10 +66,21 @@ class AnalyzeResponse(BaseModel):
     """Result document body for ``POST /analyze``: the three 0-100 scores.
 
     Stored in Redis under ``{request_id}:analyze`` when the background analysis
-    finishes. Same envelope shape as ``POST /analyze/diary`` (flat scores +
-    ``confidence`` + ``warnings`` + ``disclaimer``), just on the 0-100 metric
-    scale. Clients needing the full :class:`SkinReport` (ROI breakdown, raw
-    features, Fitzpatrick estimate) should use the CLI ``analyze`` command.
+    finishes. Deliberately minimal -- scores plus their confidence and nothing
+    else; the surrounding store document already carries the request id, kind
+    and timestamps.
+
+    Two things the pipeline produces are therefore *not* forwarded, and the
+    consuming service has to own them:
+
+    * ``report.warnings`` -- "hydration is a proxy", "no gray card, so absolute
+      colour depends on the camera", "face under-resolved". Anything that
+      qualifies how much a score can be trusted.
+    * :data:`~skin_metrics.DISCLAIMER` -- the not-a-medical-device notice, which
+      must still reach the end user somewhere in the product.
+
+    Clients needing the full :class:`SkinReport` (ROI breakdown, raw features,
+    Fitzpatrick estimate, warnings) should use the CLI ``analyze`` command.
     """
 
     pigmentation: float = Field(ge=0.0, le=100.0, description="Higher = more pigmentation.")
@@ -80,21 +91,15 @@ class AnalyzeResponse(BaseModel):
     confidence: dict[str, float] = Field(
         description="Per-score confidence in [0, 1], from the underlying metrics."
     )
-    warnings: list[str] = Field(default_factory=list)
-    elapsed_ms: float = Field(description="Server-side wall time for fetch + analysis.")
-    version: str = __version__
-    disclaimer: str = DISCLAIMER
 
     @classmethod
-    def from_report(cls, report: SkinReport, elapsed_ms: float) -> "AnalyzeResponse":
+    def from_report(cls, report: SkinReport) -> "AnalyzeResponse":
         """Flatten a full :class:`SkinReport` into the three 0-100 scores.
 
         Parameters
         ----------
         report : SkinReport
             Output of :func:`skin_metrics.pipeline.analyze`.
-        elapsed_ms : float
-            Wall time to report.
 
         Returns
         -------
@@ -110,8 +115,6 @@ class AnalyzeResponse(BaseModel):
                 "erythema": round(report.erythema.confidence, 3),
                 "hydration": round(report.hydration.confidence, 3),
             },
-            warnings=list(report.warnings),
-            elapsed_ms=elapsed_ms,
         )
 
 
@@ -146,6 +149,10 @@ class DiaryAnalyzeResponse(BaseModel):
       is a sensation, not separately measurable from a photo, so it shares this
       value.
     - ``redness``: 붉은기. Higher = redder (``erythema score / 10``).
+
+    Like :class:`AnalyzeResponse` this carries scores only: ``report.warnings``
+    and the not-a-medical-device disclaimer are dropped, so the consuming
+    service owns them.
     """
 
     skin_tone: float = Field(ge=0.0, le=10.0, description="0 = dark, 10 = very bright.")
@@ -156,21 +163,15 @@ class DiaryAnalyzeResponse(BaseModel):
     confidence: dict[str, float] = Field(
         description="Per-score confidence in [0, 1], from the underlying metrics."
     )
-    warnings: list[str] = Field(default_factory=list)
-    elapsed_ms: float = Field(description="Server-side wall time for fetch + analysis.")
-    version: str = __version__
-    disclaimer: str = DISCLAIMER
 
     @classmethod
-    def from_report(cls, report: SkinReport, elapsed_ms: float) -> "DiaryAnalyzeResponse":
+    def from_report(cls, report: SkinReport) -> "DiaryAnalyzeResponse":
         """Collapse a full :class:`SkinReport` into the three 0-10 scores.
 
         Parameters
         ----------
         report : SkinReport
             Output of :func:`skin_metrics.pipeline.analyze`.
-        elapsed_ms : float
-            Wall time to report.
 
         Returns
         -------
@@ -195,8 +196,6 @@ class DiaryAnalyzeResponse(BaseModel):
                 "dryness": round(report.hydration.confidence, 3),
                 "redness": round(report.erythema.confidence, 3),
             },
-            warnings=list(report.warnings),
-            elapsed_ms=elapsed_ms,
         )
 
 

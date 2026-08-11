@@ -622,9 +622,7 @@ URL을 설정하지 않으면 프로세스 내부 메모리 스토어로 폴백�
     "pigmentation": 38.39,   // 높을수록 색소침착 많음
     "erythema": 55.52,       // 높을수록 붉음
     "hydration": 70.80,      // 높을수록 촉촉 (proxy)
-    "confidence": { "pigmentation": 0.6, "erythema": 0.6, "hydration": 0.6 },
-    "warnings": [ /* ... */ ], "elapsed_ms": 6900.0,
-    "version": "0.1.0", "disclaimer": "..."
+    "confidence": { "pigmentation": 0.6, "erythema": 0.6, "hydration": 0.6 }
   }
 }
 
@@ -635,7 +633,7 @@ URL을 설정하지 않으면 프로세스 내부 메모리 스토어로 폴백�
     "skin_tone": 7.8,      // 피부 톤 밝기: 0=어두움, 10=매우 밝음 (ITA 선형 매핑)
     "dryness": 2.9,        // 당김·건조함 정도: 0=촉촉, 10=매우 건조 (= (100-hydration)/10)
     "redness": 5.6,        // 붉은기: 0=없음, 10=강함 (= erythema/10)
-    "confidence": { /* ... */ }, "warnings": [ /* ... */ ], /* ... */
+    "confidence": { "skin_tone": 0.6, "dryness": 0.6, "redness": 0.6 }
   }
 }
 
@@ -646,12 +644,17 @@ URL을 설정하지 않으면 프로세스 내부 메모리 스토어로 폴백�
 }
 ```
 
-- 두 result는 **같은 envelope**(점수 + `confidence` + `warnings` + `disclaimer`)이고
-  점수 축만 다릅니다(0~100 vs 0~10). 전체 `SkinReport`가 필요하면 CLI `analyze`.
+- `result`는 **점수와 confidence만** 담습니다. 요청 식별자·시각은 바깥 envelope에 있습니다.
 - **`skin_tone`은 절대 색상 기반(ITA)**이라 카메라·조명에 민감합니다.
   `reference_bbox`(그레이카드)를 주면 기기 독립적이 됩니다.
 - **`dryness`는 당김·건조함을 하나로** 제공합니다 — 당김은 감각이라 사진에서 분리 측정이
   불가능하고, 광학적으로는 동일한 건조 신호입니다.
+
+> ⚠️ **응답에서 빠진 것은 소비하는 쪽 책임입니다.**
+> `result`에는 파이프라인의 `warnings`(수분은 proxy 추정 / 그레이카드가 없어 절대 색상
+> 신뢰도 낮음 / 얼굴이 작아 텍스처 신뢰도 낮음)와 **의료기기 아님 고지**가 들어가지
+> 않습니다. 점수의 신뢰도를 UI에서 표현하려면 `confidence`를 쓰고, 고지는 서비스에서
+> 별도로 노출하세요. 두 정보가 필요하면 CLI `analyze`가 전체 `SkinReport`를 냅니다.
 
 ### `GET /results/{key}`
 

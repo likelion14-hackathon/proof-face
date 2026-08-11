@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import time
 import uuid
 from contextlib import asynccontextmanager
 
@@ -204,11 +203,9 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
     async def _process(request_id: str, kind: str, payload: AnalyzeRequest) -> None:
         """Background worker: analyze and store the outcome under its key."""
         store = app.state.results
-        started = time.perf_counter()
         try:
             report = await _run_report(payload, app)
-            elapsed = round((time.perf_counter() - started) * 1000.0, 2)
-            body = _RESULT_MODELS[kind].from_report(report, elapsed_ms=elapsed)
+            body = _RESULT_MODELS[kind].from_report(report)
             await store.finish(request_id, kind, body.model_dump())
         except (ImageFetchError, AnalysisError) as exc:
             await store.fail(request_id, kind, exc.code, exc.message)
