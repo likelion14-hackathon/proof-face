@@ -161,7 +161,7 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
         title="skin-metrics API",
         version=__version__,
         description=(
-            "Pigmentation / erythema / hydration-proxy scoring from a single face "
+            "Pigmentation / erythema / pore scoring from a single face "
             "image URL. Submissions are asynchronous: POST returns a request_id "
             "and the result lands in Redis as {request_id}:analyze / "
             "{request_id}:diary.\n\n**NOT a medical device.** " + DISCLAIMER
@@ -299,7 +299,7 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
         """Submit ``image_url`` for the 0-10 diary scores.
 
         Same flow as ``/analyze``; the result document (shape:
-        :class:`DiaryAnalyzeResponse` -- ``skin_tone`` / ``dryness`` (당김·건조함)
+        :class:`DiaryAnalyzeResponse` -- ``skin_tone`` / ``pores`` (모공)
         / ``redness``) lands under ``{request_id}:diary``.
         """
         return await _submit(payload, request, "diary")

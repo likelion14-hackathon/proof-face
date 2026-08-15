@@ -11,7 +11,7 @@ Three things are fitted, all from the CSVs written by
    which alone made the composite scores meaningless.
 2. **Supervised instrument models** -- ridge regressions from the per-ROI
    physics features onto the instrument readings measured on that same ROI
-   (Corneometer moisture; expert pigmentation grade). A model only ships if it
+   (instrument pore count; expert pigmentation grade). A model only ships if it
    clears :func:`accept_model` on held-out subjects; otherwise the metric keeps
    the unsupervised composite and the profile records the rejection.
 3. **Reference distributions** -- empirical percentile grids of the score
@@ -35,16 +35,18 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 
 # Sub-feature blocks handed to each supervised model. Deliberately restricted to
-# the metric's own physics block: letting the hydration model see melanin/ITA
-# would have it predict moisture from skin tone, which does not transfer.
-HYDRATION_FEATURES = (
-    "f_hydration_scaling_index",
-    "f_hydration_glcm_contrast",
-    "f_hydration_glcm_correlation",
-    "f_hydration_glcm_energy",
-    "f_hydration_lbp_uniformity",
-    "f_hydration_wrinkle_density",
-    "f_hydration_specular_ratio",
+# the metric's own physics block: letting the pore model see melanin/ITA would
+# have it predict pore count from skin tone, which does not transfer across
+# cameras. The restriction costs nothing here -- an unrestricted subset search
+# over every extracted feature picked only texture features anyway.
+PORE_FEATURES = (
+    "f_pores_scaling_index",
+    "f_pores_glcm_contrast",
+    "f_pores_glcm_correlation",
+    "f_pores_glcm_energy",
+    "f_pores_lbp_uniformity",
+    "f_pores_wrinkle_density",
+    "f_pores_specular_ratio",
 )
 PIGMENTATION_FEATURES = (
     "f_pigmentation_melanin_index",
@@ -57,7 +59,7 @@ PIGMENTATION_FEATURES = (
 
 # ROIs that carry each instrument label, hence the ROIs a model may be applied
 # to at inference time. (The nose is never measured by the instruments.)
-MOISTURE_ROIS = ("forehead", "left_cheek", "right_cheek", "chin")
+PORE_ROIS = ("left_cheek", "right_cheek")
 PIGMENTATION_ROIS = ("forehead", "left_cheek", "right_cheek")
 
 # A Fitzpatrick bucket needs at least this many cohort images to get its own
@@ -66,7 +68,7 @@ MIN_BUCKET_N = 80
 
 # Acceptance gate for a supervised model. A model that barely beats "always
 # predict the cohort mean" must not be shipped: the report would print a
-# concrete instrument value (e.g. "moisture 62 a.u.") that carries almost no
+# concrete instrument value (e.g. "820 pores") that carries almost no
 # information about the individual. Failing the gate is not an error -- the
 # metric falls back to the cohort-percentile composite and the profile records
 # why, which is the honest outcome.
@@ -310,20 +312,24 @@ def evaluate_ridge(
 # image.
 COMPOSITE_TARGETS: dict[str, str] = {
     "pigmentation": "label_pigmentation_count",
-    "hydration": "label_moisture",
+    "pores": "label_pore_count",
 }
 
 # Which table each metric is fitted on. Pigmentation's instrument reading is one
-# whole-face spot count, so it can only be fitted face-level. The Corneometer
-# reads *per site*, and averaging those readings into one face number throws
-# away most of the signal -- fitting it ROI-level (restricted to the sites the
-# metric declares in `composite.<metric>.rois`) measured +0.176 -> +0.280 on
-# held-out cheeks where the face-level fit had collapsed to -0.208.
-COMPOSITE_LEVEL: dict[str, str] = {"pigmentation": "face", "hydration": "roi"}
+# whole-face spot count, so it can only be fitted face-level. Pores are counted
+# *per cheek*, and averaging those readings into one face number throws away
+# signal, so they are fitted ROI-level, restricted to the sites the metric
+# declares in `composite.<metric>.rois`.
+COMPOSITE_LEVEL: dict[str, str] = {"pigmentation": "face", "pores": "roi"}
 
 # Sign that maps the target onto the score's orientation (higher = more
-# pronounced). Moisture runs the other way: more moisture, less dryness.
-COMPOSITE_TARGET_SIGN: dict[str, float] = {"pigmentation": 1.0, "hydration": -1.0}
+# pronounced). Both current targets are counts of the thing being scored, so
+# both are +1. A target measuring the *good* end of a scale (a moisture reading,
+# say) needs -1 here, and `fit_composite_weights(sign=...)` must receive it --
+# regressing on the un-flipped target yields exactly sign-flipped weights, which
+# the acceptance gate then rejects as "anti-correlated". That failure is silent,
+# so `tests/test_calibrate.py` pins it.
+COMPOSITE_TARGET_SIGN: dict[str, float] = {"pigmentation": 1.0, "pores": 1.0}
 
 # Fitted weights must beat the hand-set ones by at least this much Spearman on
 # held-out subjects before they are shipped.
@@ -403,11 +409,12 @@ def fit_composite_weights(
         Fitted anchors, used to standardise exactly as the scorer will.
     sign : float, optional
         :data:`COMPOSITE_TARGET_SIGN` for this metric. The composite driver is
-        oriented "higher = more pronounced", which for hydration is the
-        *opposite* of the instrument (more moisture, less dryness). Regressing
-        on the raw target here would return weights of the wrong sign, and the
-        gate would then reject them for being anti-correlated -- which is what
-        happened to hydration on every device before this argument existed.
+        oriented "higher = more pronounced". Both current targets already run
+        that way (+1), but for one that does not -- an instrument reading the
+        *good* end of the scale, such as moisture -- regressing on the raw
+        target returns weights of exactly the wrong sign, and the gate then
+        rejects them for being anti-correlated. That is what happened to the
+        moisture metric on every device before this argument existed.
     alphas : iterable of float, optional
         Ridge penalties searched by cross-validation.
 
@@ -677,15 +684,14 @@ def fit_calibration(
 
     specs = (
         (
-            "hydration",
-            HYDRATION_FEATURES,
-            "label_moisture",
-            MOISTURE_ROIS,
+            "pores",
+            PORE_FEATURES,
+            "label_pore_count",
+            PORE_ROIS,
             {
-                "target": "corneometer_moisture",
-                "target_units": "a.u.",
-                # The score reads "how dry", so more moisture must score lower.
-                "score_sign": -1.0,
+                "target": "instrument_pore_count",
+                "target_units": "count",
+                "score_sign": 1.0,
             },
         ),
         (

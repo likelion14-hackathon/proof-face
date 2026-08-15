@@ -106,12 +106,12 @@ def compare(
     baseline = {
         "pigmentation": r1.pigmentation.score,
         "erythema": r1.erythema.score,
-        "hydration": r1.hydration.score,
+        "pores": r1.pores.score,
     }
     current = {
         "pigmentation": r2.pigmentation.score,
         "erythema": r2.erythema.score,
-        "hydration": r2.hydration.score,
+        "pores": r2.pores.score,
     }
     result = {
         "baseline": baseline,

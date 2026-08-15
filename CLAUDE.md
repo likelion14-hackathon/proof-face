@@ -6,13 +6,55 @@
 
 ## 프로젝트 한 줄 요약
 
-얼굴 이미지 1장에서 **색소침착 / 홍조 / 수분력(proxy)** 를 0~100으로 산출.
+얼굴 이미지 1장에서 **색소침착 / 홍조 / 모공** 을 0~100으로 산출.
 **Phase 1(물리 기반, 학습 불필요)** 이 실제 "이미지→지수" 엔진이고,
 **Phase 2(딥러닝)** 는 실측 라벨이 생기면 붙일 수 있는 **완전히 도는 스캐폴드**.
 
-## 현재 상태 (2026-08-11 기준)
+## 현재 상태 (2026-08-15 기준)
 
-### 최신 라운드 (Redis 비동기 전환 + `/analyze/diary`)
+### 최신 라운드 (수분력 → 모공 교체)
+
+팀 회의 결과 "수분력을 모공·탄력으로 바꾸자"는 요청이 왔고, 실측으로 검토해
+**모공은 채택, 탄력은 기각**했습니다. 코퍼스에 `label_pore_count` / `label_elasticity_r2`가
+이미 있었고 추출 CSV에도 들어 있어서 **재추출 없이** 판단했습니다.
+
+1. **모공 held-out +0.575 — 시스템에서 가장 강한 지표**. `lbp_uniformity` 단독 -0.581,
+   기기별 폰 -0.563 / 태블릿 -0.567 / DSLR -0.650. 사람 단위(좌우 볼 평균) +0.591.
+   비교: 색소 +0.578(장비) / +0.422(등급), 예전 수분 +0.320.
+   **나이 추정기가 아님을 확인**: 나이를 편상관으로 제거해도 -0.581 → -0.557로 거의 유지.
+   (모공은 1mm 이하지만 빛을 다르게 산란시켜 사진에 실제로 찍힙니다.)
+2. **탄력은 기각**. composite +0.329까지는 가지만 **나이 단독이 -0.434로 더 잘 맞히고**,
+   나이를 제거하면 +0.171로 붕괴. 사실상 나이 추정기. 채택 특징에 `ita`(절대 색상)가 끼어
+   기기 전이도 안 됨(폰 +0.278 vs DSLR +0.382). Cutometer R2는 흡입 후 기계적 복원율이라
+   Corneometer와 같은 부류 — 사진에 안 찍히는 물리량.
+3. **특징 세트는 전수 탐색으로 확정**: `lbp_uniformity` -0.78 / `scaling_index` +0.13 /
+   `glcm_contrast` -0.09. 4번째 특징은 +0.001이라 3개에서 중단. **색소 특징은 후보 풀에
+   있었지만 하나도 안 들어옴** — 색상이 아니라 텍스처 측정이라는 뜻이고, 그래서 기기를 넘습니다.
+4. **지도학습 릿지가 게이트를 통과** (색소·수분은 전부 탈락했던 그 게이트):
+   r=+0.488, MAE 265.8 vs 308.5(+13.8%), **세 기기 전부 개선**(폰 +9.4 / 태블릿 +10.8 /
+   DSLR +21.3%). 그래서 배포 경로는 릿지이고 `calibrated=True`, `predicted_units="count"`.
+   순위 성능은 composite과 동률(+0.572 vs +0.575)이라 `validation_weights`는 선언값 유지.
+   ⚠️ **예측 개수는 순위용이지 개수가 아닙니다** — 실사진에서 실측 62/910/1737 → 예측
+   629/922/1209로 평균 쪽 수축. 리포트에 경고를 넣었고 API는 점수만 내보냅니다.
+5. **집계는 볼만** (`composite.pores.rois`). 장비가 좌우 볼에서만 셌기 때문.
+   볼만 +0.591 / 볼+코 +0.575 / 볼+이마 +0.573 / 5부위 +0.545. 코만 써도 +0.391이 나오므로
+   T존이 무신호인 게 아니라, 볼 라벨에 채점하고 anchor·분위수 격자도 볼 통계라서입니다.
+6. **이름 변경 (파괴적)**: 지표 `hydration` → `pores`, 모듈 `features/hydration_proxy.py` →
+   `features/pores.py`, 함수에서 `_proxy` 접미사 제거(`texture_stats`, `scaling_index`,
+   `specular_ratio`, `micro_wrinkle_density`), config 블록 `hydration_proxy:` → `pores:`,
+   CSV 열 `f_hydration_*` → `f_pores_*`.
+   **HTTP 응답 필드도 바뀝니다**: `/analyze`의 `hydration` → `pores`,
+   `/analyze/diary`의 `dryness` → `pores`. Spring Boot 쪽 계약 동시 변경 필요.
+   `is_estimate`는 **False**(세 지표 모두) — 모공은 실제로 찍히는 구조입니다.
+   `scoring.report_inverted`는 **빈 리스트**가 됐지만 기계는 남겨뒀습니다(아래 함정 참조).
+7. **CSV는 헤더만 relabel**했습니다. 값은 같은 코드가 낸 것이라 재계산 불필요 — 27분 재추출
+   안 했습니다. `calibration_work*` 4개 디렉토리 전부 처리.
+
+검증: 138개 테스트 통과, `calibrate fit` 재실행으로 `calibration_profile.yaml` 재생성,
+held-out 실사진 3장 end-to-end(점수 12.1 / 47.4 / 99.1 for 실측 62 / 910 / 1737),
+held-out 321명 점수 분포 평균 51.4·십분위 22~42·범위 0.1~99.5.
+
+### 이전 라운드 (Redis 비동기 전환 + `/analyze/diary`)
 
 Spring Boot 백엔드와의 연동을 위해 API가 **비동기**로 바뀌었습니다.
 
@@ -68,7 +110,8 @@ Spring Boot 백엔드와의 연동을 위해 API가 **비동기**로 바뀌었�
    기기별 +0.292(폰) / +0.389(태블릿) / +0.339(DSLR). **재추출 불필요였음** — face CSV가
    이미 볼 집계로 전 특징을 들고 있음.
 2. **`POST /analyze/simple` 추가** — 소비자용 0~10 점수 3개: `skin_tone`(ITA -30°~55° →
-   0~10 선형, 절대 색상이라 기기 민감), `dryness`(당김·건조함 통합, `(100-hydration)/10`),
+   0~10 선형, 절대 색상이라 기기 민감), `dryness`(당김·건조함 통합, `(100-hydration)/10`;
+   최신 라운드에서 `pores`로 교체됨),
    `redness`(`erythema/10`). 매핑은 `api/schemas.py`의
    `SimpleAnalyzeResponse.from_report`. `app.py`는 두 엔드포인트가 fetch→파이프라인→오류
    매핑을 `_run_report` + `AnalysisError` 핸들러로 공유하도록 리팩토링.
@@ -151,7 +194,11 @@ Corneometer·전문가 등급 실측)로 보정하면서 **정확도 관련 실�
 (Corneometer는 전기 용량 측정이라 표면 광학에 신호가 거의 없음). 최종 프로파일은
 **풀링 + `supervised: {}`**.
 
-### 수분력 라운드 (2026-08-11)
+### 수분력 라운드 (2026-08-11) — ⚠️ 지표는 이후 모공으로 교체됨
+
+아래 내용은 **이력**입니다. 수분 지표 자체는 최신 라운드에서 제거됐지만, 여기서 만든
+인프라(지표별 `rois` 제한, `fit_composite_weights(sign=...)`, 볼 전용 anchor)는 그대로
+모공이 쓰고 있으므로 근거를 남깁니다.
 
 "수분을 무조건 제공해야 한다"는 요구에 맞춰 다시 파고들어 **버그 2건**을 찾았습니다.
 이전 라운드에서 "수분은 물리적으로 불가능"이라고 결론 냈던 것은 **부분적으로 틀렸습니다** —
@@ -274,7 +321,7 @@ pipeline.analyze(img, ref_bbox, ccm, landmarks, model_path, config)
    ├─ pipeline._normalize_face_scale  # eye-span 512px로 다운스케일 (선형 광에서)
    ├─ calibration.color.rgb_to_lab(D65)
    ├─ detection.face.extract_rois → {name: ROIResult|None}  (5 ROI, 0.6 게이트)
-   └─ features.{pigmentation,erythema,hydration_proxy}   (ROI valid_mask 내부만)
+   └─ features.{pigmentation,erythema,pores}   (ROI valid_mask 내부만)
 └─ pipeline._score_metric (지표별)
    ├─ config["supervised"][metric] 있으면 → scoring.normalize.predict_instrument
    │     (학습된 ROI에만 적용, 유효픽셀 가중평균) → driver = score_sign × 예측값
@@ -322,10 +369,12 @@ Phase 2: `models.dataset(SkinDataset/DummyLabelGenerator)` → `models.network.S
   이미지는 `(H,W,3)` float, `linear`/`sRGB` 구분을 주석·인자로 명확히.
 - **무거운 의존성은 지연 import**: 함수 내부에서 `import torch/mediapipe/timm/...`.
   모듈 최상단에서 import하면 Phase 1 테스트가 깨짐.
-- **수분력은 항상 proxy**: 함수명·docstring·`is_estimate=True`로 표기 유지.
-- **`hydration` 리포트 방향은 "높을수록 촉촉"**, 내부 계산은 "높을수록 건조".
-  `scoring.report_inverted`가 `pipeline._score_metric._finish`에서 마지막에 뒤집습니다.
-  더 앞에서 뒤집으면 프로파일의 검증 수치·`COMPOSITE_TARGET_SIGN`과 어긋납니다.
+- **세 지표 모두 "높을수록 나쁨"** 이고 `is_estimate=False`입니다. 방향이 반대인 지표를
+  새로 넣으면 `scoring.report_inverted`에 이름을 넣어 `pipeline._score_metric._finish`에서
+  **마지막에** 뒤집으세요. 더 앞에서 뒤집으면 프로파일의 검증 수치·`COMPOSITE_TARGET_SIGN`과
+  어긋납니다. (예전 `hydration`이 그 경우였습니다.)
+- **모공 예측 개수를 개수로 쓰지 마세요**. `predicted_value`는 순위용입니다
+  (평균 대비 13.8% 개선). API는 점수만 내보내고, 이 구분은 리포트 경고가 지킵니다.
 - **의료기기 아님 고지**는 `SkinReport.disclaimer`(자동)·README·CLI에 유지.
 - **테스트는 합성 데이터**: 실제 얼굴 사진/네트워크 없이 도는 것을 유지
   (`tests/conftest.py`의 `synthetic_image`/`synthetic_landmarks`,
@@ -336,20 +385,21 @@ Phase 2: `models.dataset(SkinDataset/DummyLabelGenerator)` → `models.network.S
 - **인물 사진에 whole-image gray-world 금지**. 장면 평균이 곧 피부색이라 a*/b*가 0으로
   붕괴하고 ITA가 ±90°에서 포화·부호 반전합니다. `calibration.fallback`을 `grayworld`로
   되돌리지 마세요(측정 근거는 README "인물 사진에 gray-world를 쓰면 안 되는 이유").
-- **얼굴 크기 정규화는 다운스케일 전용**. 업샘플링하면 텍스처가 매끄러워져 거짓으로
-  촉촉하게 읽힙니다. 500×500 합성 테스트 이미지는 eye-span이 140px이라 정규화가
+- **얼굴 크기 정규화는 다운스케일 전용**. 업샘플링하면 텍스처가 매끄러워져 모공이 거짓으로
+  적게 읽힙니다. 500×500 합성 테스트 이미지는 eye-span이 140px이라 정규화가
   no-op이 되고, 그래서 기존 테스트 지오메트리가 그대로 유지됩니다.
 - **`target_eye_span_px: 512`를 올리지 마세요**. "다운스케일이 정보를 버린다"는 직관은
-  실측으로 반증됐습니다. 정규화를 끄고 폰 정면을 원본 해상도로 돌리면 수분 일치도가
-  +0.053 → **+0.003**으로 무너집니다(전 특징 악화). 폰의 노이즈 리덕션·샤프닝
+  실측으로 반증됐습니다. 정규화를 끄고 폰 정면을 원본 해상도로 돌리면 일치도가
+  +0.053 → **+0.003**으로 무너집니다(전 특징 악화; 당시 수분 기준 측정). 폰의 노이즈 리덕션·샤프닝
   아티팩트가 원본 해상도에서 피부와 무관한 텍스처로 읽히고, 다운스케일이 그걸 뭉갭니다.
-- **집계 ROI는 지표마다 다릅니다** (`composite.<metric>.rois`). 수분은 **볼만** 씁니다 —
-  Corneometer가 코에서는 측정된 적이 없고 이마·턱은 신호가 거의 없습니다. 전체 ROI로
-  되돌리면 일치도가 절반으로 떨어집니다. 지표를 추가하면 그 지표의 실측 부위를 확인하고
-  `rois`를 명시하세요.
-- **`COMPOSITE_TARGET_SIGN`은 피팅에도 전달돼야 합니다**. `fit_composite_weights(sign=...)`를
-  빠뜨리면 sign=-1 지표(수분)에서 **부호가 뒤집힌 가중치**가 나오고, 게이트가 그걸
-  "반상관"으로 오해해 기각합니다. 조용히 실패하므로 `tests/test_calibrate.py::
+- **집계 ROI는 지표마다 다릅니다** (`composite.<metric>.rois`). 모공은 **볼만** 씁니다 —
+  장비가 좌우 볼에서만 셌기 때문입니다. 볼만 +0.591 / 볼+코 +0.575 / 5부위 +0.545.
+  ⚠️ 코만 써도 +0.391이 나오므로 **T존이 무신호라서가 아닙니다**. 볼 라벨에 채점하고
+  anchor·분위수 격자도 볼 통계라서, 보정 안 된 부위로 넓히면 눈금이 의미를 잃습니다.
+  지표를 추가하면 그 지표의 실측 부위를 확인하고 `rois`를 명시하세요.
+- **`COMPOSITE_TARGET_SIGN`은 피팅에도 전달돼야 합니다**. 현재 두 지표 모두 sign=+1이라
+  티가 안 나지만, `fit_composite_weights(sign=...)`를 빠뜨리면 sign=-1 지표에서 **부호가
+  뒤집힌 가중치**가 나오고, 게이트가 그걸 "반상관"으로 오해해 기각합니다. 조용히 실패하므로 `tests/test_calibrate.py::
   test_fit_composite_weights_honours_an_inverted_target`가 지킵니다.
 - **`calibration_profile.yaml`은 생성 파일**. 손으로 고치지 말고
   `skin-metrics calibrate fit`으로 재생성. 사람이 쓰는 설정·근거는 `config.yaml`에만.
@@ -357,11 +407,12 @@ Phase 2: `models.dataset(SkinDataset/DummyLabelGenerator)` → `models.network.S
   거기 적힌 **특징 목록이 피팅 대상 집합**을 정합니다(anchor도 이 목록으로 만들어짐).
 - **composite 가중치는 음수가 될 수 있습니다**(suppressor). 정규화는 반드시 `|w|` 합으로.
   부호 있는 합으로 나누면 합이 0 근처일 때 폭발하거나 조용히 0이 됩니다.
-  현재 수분 세트의 `glcm_contrast` -0.30 / `lbp_uniformity` -0.25가 실제 예 — 단독으론
-  무상관이지만 suppressor로 +0.075를 벌어줍니다. "음수라서" 지우면 안 됩니다.
-- **`/analyze/diary`의 `dryness`는 리포트 방향(높을수록 촉촉) 위에서 한 번 더 뒤집습니다**
-  (`(100-hydration)/10`). `scoring.report_inverted`를 건드리면
-  `DiaryAnalyzeResponse.from_report`와 `tests/test_api.py`의 diary 테스트도 같이 확인.
+  현재 모공 세트의 `lbp_uniformity` -0.78 / `glcm_contrast` -0.09가 실제 예입니다.
+  `lbp_uniformity`는 텍스처가 복잡할수록 내려가므로 음수가 정상이고, `glcm_contrast`는
+  suppressor입니다. "음수라서" 지우면 안 됩니다.
+- **`/analyze/diary`는 이제 전부 단순 `/10`입니다** (`pores`, `redness`). 예전 `dryness`는
+  `(100-hydration)/10`으로 한 번 더 뒤집었지만 그 지표가 없어졌습니다. `scoring.report_inverted`를
+  건드리면 `DiaryAnalyzeResponse.from_report`와 `tests/test_api.py`의 diary 테스트도 같이 확인.
   `skin_tone`은 ITA 절대 색상 기반이라 diary 응답에서 유일하게 기기·조명 민감.
 - **API 테스트는 비동기 플로우를 폴링**합니다: `_submit` → `_wait_result`가
   `GET /results/{key}`를 돌며 `processing`이 끝나길 기다림. TestClient의 portal 루프가
@@ -433,9 +484,11 @@ Phase 2: `models.dataset(SkinDataset/DummyLabelGenerator)` → `models.network.S
    `calibrate/fit.py`의 `specs` 튜플에 한 줄 추가하면 그대로 붙습니다.
 2. **색소 모델 개선**: 현재 릿지(선형)로 held-out r≈0.54. 특징을 늘리거나
    (ROI별 상수항, 나이 대용 특징) 순서형 회귀로 바꾸면 더 오를 여지가 있습니다.
-   ※ 수분은 +0.320까지 왔습니다(부분집합 탐색으로 기존 추출 특징은 소진).
-   다음 레버는 **새 볼 전용 텍스처 특징**(재추출 필요, 27분) 아니면
-   **TEWL/Corneometer 자체 측정**입니다.
+   ※ 모공은 +0.575로 가장 강하고, 기존 추출 특징은 전수 탐색으로 소진했습니다
+   (4번째 특징 +0.001). 다음 레버는 **모공 검출 전용 특징 신규 추가**(재추출 27분) 아니면
+   **T존 실측 라벨 확보**로 집계 부위를 넓히는 것입니다. 후자가 체감이 클 수 있습니다 —
+   사용자가 가장 신경 쓰는 코가 지금은 점수에 안 들어갑니다.
+   ※ **탄력은 검토 후 기각**했습니다(나이 추정기). 다시 꺼내지 마세요 — 근거는 최신 라운드.
 3. **Phase 2 실학습**: 라벨 CSV가 이제 실제로 존재합니다.
    `calibrate/aihub.py`의 `iter_roi_rows`로 `SkinDataset.from_csv` 형식을 만들면
    `train --data labels.csv --mode regression` 가능. 다만 38GB 이미지 학습이라

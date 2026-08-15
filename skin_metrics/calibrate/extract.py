@@ -30,7 +30,7 @@ from typing import Any, Iterable, Sequence
 
 from .aihub import Sample, index_dataset
 
-METRICS = ("pigmentation", "erythema", "hydration")
+METRICS = ("pigmentation", "erythema", "pores")
 
 # Identity/label columns written ahead of the feature columns.
 _ROI_ID_COLUMNS = (
@@ -73,7 +73,7 @@ def _feature_columns() -> list[str]:
             "erythema_index", "mean_a_star", "p90_a_star",
             "hemoglobin", "hemoglobin_ok",
         ),
-        "hydration": (
+        "pores": (
             "specular_ratio", "specular_inv", "glcm_contrast",
             "glcm_correlation", "glcm_energy", "lbp_uniformity",
             "scaling_index", "wrinkle_density",

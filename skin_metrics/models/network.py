@@ -6,7 +6,7 @@ Architecture
   pooled to a feature vector.
 - **Physics branch**: an MLP that embeds the Phase-1 feature vector.
 - **Fusion**: image + physics features are concatenated.
-- **Heads**: three regression heads (pigmentation / erythema / hydration) with
+- **Heads**: three regression heads (pigmentation / erythema / pores) with
   **homoscedastic uncertainty weighting** to balance the multitask loss.
 - **Illumination invariance**: a **gradient-reversal layer** feeds a domain
   (illumination-bucket) classifier, so the shared features are pushed to be

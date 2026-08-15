@@ -73,9 +73,9 @@ class AnalyzeResponse(BaseModel):
     Two things the pipeline produces are therefore *not* forwarded, and the
     consuming service has to own them:
 
-    * ``report.warnings`` -- "hydration is a proxy", "no gray card, so absolute
-      colour depends on the camera", "face under-resolved". Anything that
-      qualifies how much a score can be trusted.
+    * ``report.warnings`` -- "no gray card, so absolute colour depends on the
+      camera", "face under-resolved", "the pore count is a ranking, not a
+      count". Anything that qualifies how much a score can be trusted.
     * :data:`~skin_metrics.DISCLAIMER` -- the not-a-medical-device notice, which
       must still reach the end user somewhere in the product.
 
@@ -85,8 +85,8 @@ class AnalyzeResponse(BaseModel):
 
     pigmentation: float = Field(ge=0.0, le=100.0, description="Higher = more pigmentation.")
     erythema: float = Field(ge=0.0, le=100.0, description="Higher = more redness.")
-    hydration: float = Field(
-        ge=0.0, le=100.0, description="Higher = moister (PROXY estimate, not a measurement)."
+    pores: float = Field(
+        ge=0.0, le=100.0, description="Higher = more visible pores. Measured on the cheeks."
     )
     confidence: dict[str, float] = Field(
         description="Per-score confidence in [0, 1], from the underlying metrics."
@@ -109,11 +109,11 @@ class AnalyzeResponse(BaseModel):
         return cls(
             pigmentation=round(report.pigmentation.score, 2),
             erythema=round(report.erythema.score, 2),
-            hydration=round(report.hydration.score, 2),
+            pores=round(report.pores.score, 2),
             confidence={
                 "pigmentation": round(report.pigmentation.confidence, 3),
                 "erythema": round(report.erythema.confidence, 3),
-                "hydration": round(report.hydration.confidence, 3),
+                "pores": round(report.pores.confidence, 3),
             },
         )
 
@@ -146,10 +146,10 @@ class DiaryAnalyzeResponse(BaseModel):
       Higher = brighter. ITA is an *absolute colour* quantity, so it is the one
       field here that shifts with camera/lighting unless a ``reference_bbox``
       gray card is supplied.
-    - ``dryness``: 당김·건조함 정도. Higher = drier/tighter. This is the
-      hydration proxy re-oriented (``(100 - hydration score) / 10``); tightness
-      is a sensation, not separately measurable from a photo, so it shares this
-      value.
+    - ``pores``: 모공. Higher = more visible pores (``pore score / 10``).
+      Measured on the cheeks, where the calibration cohort's instrument counted
+      them; the T-zone is not scored even though it is where pores are most
+      visible.
     - ``redness``: 붉은기. Higher = redder (``erythema score / 10``).
 
     Like :class:`AnalyzeResponse` this carries scores only: ``report.warnings``
@@ -158,8 +158,8 @@ class DiaryAnalyzeResponse(BaseModel):
     """
 
     skin_tone: float = Field(ge=0.0, le=10.0, description="0 = dark, 10 = very bright.")
-    dryness: float = Field(
-        ge=0.0, le=10.0, description="당김·건조함: 0 = moist, 10 = very dry (proxy)."
+    pores: float = Field(
+        ge=0.0, le=10.0, description="모공: 0 = barely visible, 10 = very visible."
     )
     redness: float = Field(ge=0.0, le=10.0, description="붉은기: 0 = none, 10 = strong.")
     confidence: dict[str, float] = Field(
@@ -191,11 +191,11 @@ class DiaryAnalyzeResponse(BaseModel):
 
         return cls(
             skin_tone=_clip10(tone),
-            dryness=_clip10((100.0 - report.hydration.score) / 10.0),
+            pores=_clip10(report.pores.score / 10.0),
             redness=_clip10(report.erythema.score / 10.0),
             confidence={
                 "skin_tone": round(report.pigmentation.confidence, 3),
-                "dryness": round(report.hydration.confidence, 3),
+                "pores": round(report.pores.confidence, 3),
                 "redness": round(report.erythema.confidence, 3),
             },
         )

@@ -1,12 +1,17 @@
-"""Hydration PROXY features (Phase 1, physics-based).
+"""Surface-texture features, which drive the pore metric (Phase 1).
 
-IMPORTANT
----------
-RGB imaging CANNOT measure skin water content directly. Every function here is
-an *estimate / proxy* derived from surface optics and texture (shine, GLCM/LBP
-texture, high-frequency scaling, micro-wrinkle density). Function names,
-docstrings, and the output schema all flag this. Do not present these values as
-a hydration measurement.
+Pore openings are one of the few skin properties a camera really does resolve:
+they are sub-millimetre pits that scatter light differently from the surrounding
+surface, so they show up directly as high-frequency texture. That is why these
+functions carry no "proxy" hedge -- unlike the moisture metric they replaced,
+which tried to infer stratum-corneum water content (a Corneometer capacitance
+reading) from surface optics that barely encode it.
+
+Three of these -- :func:`texture_stats` (``lbp_uniformity``, ``glcm_contrast``)
+and :func:`scaling_index` -- make up the fitted pore composite; see
+``composite.pores`` in ``config.yaml`` for the weights and the measured
+agreement. The rest are extracted and carried in the report, but the subset
+search left them out.
 
 All functions guard divide-by-zero and empty inputs.
 """
@@ -33,16 +38,18 @@ def _as_gray_u8(gray: np.ndarray, levels: int = 32) -> np.ndarray:
     return q
 
 
-def specular_ratio_proxy(
+def specular_ratio(
     rgb_linear: np.ndarray,
     mask: np.ndarray | None = None,
     v_min: float = 0.90,
     s_max: float = 0.20,
 ) -> float:
-    """PROXY: fraction of specular (shiny) pixels within the region.
+    """Fraction of specular (shiny) pixels within the region.
 
-    Specular highlights (high HSV ``V``, low ``S``) correlate loosely with
-    surface oil/shine, an indirect and confounded proxy for hydration.
+    Specular highlights (high HSV ``V``, low ``S``) track surface oil and
+    shine. Extracted and reported, but not part of the pore composite: on the
+    cheeks it adds nothing over the texture features (a fourth-feature search
+    moved held-out agreement by +0.001).
 
     Parameters
     ----------
@@ -70,14 +77,20 @@ def specular_ratio_proxy(
     return float(specular.mean())
 
 
-def texture_features_proxy(
+def texture_stats(
     gray: np.ndarray,
     mask: np.ndarray | None = None,
     levels: int = 32,
     lbp_radius: int = 2,
     lbp_points: int = 16,
 ) -> dict[str, float]:
-    """PROXY: GLCM (contrast/correlation/energy) and LBP texture summary.
+    """GLCM (contrast/correlation/energy) and LBP texture summary.
+
+    ``lbp_uniformity`` is the single strongest feature in the whole system: on
+    held-out cheeks it reaches -0.581 Spearman against the instrument pore
+    count, and -0.557 once age is partialled out, so it is reading pores rather
+    than reading age. It falls as texture gets busier, hence the negative
+    composite weight.
 
     Parameters
     ----------
@@ -137,11 +150,11 @@ def texture_features_proxy(
     }
 
 
-def scaling_index_proxy(gray: np.ndarray, mask: np.ndarray | None = None) -> float:
-    """PROXY: high-frequency band energy (surface scaling / roughness).
+def scaling_index(gray: np.ndarray, mask: np.ndarray | None = None) -> float:
+    """High-frequency band energy (surface relief / roughness).
 
     A Laplacian high-pass response; its variance over valid pixels rises with
-    flaky/scaly surface texture often associated with dryness.
+    visible surface relief -- pore openings, flaking, coarse texture.
 
     Parameters
     ----------
@@ -169,15 +182,17 @@ def scaling_index_proxy(gray: np.ndarray, mask: np.ndarray | None = None) -> flo
     return float(np.var(sel))
 
 
-def micro_wrinkle_density_proxy(
+def micro_wrinkle_density(
     gray: np.ndarray,
     mask: np.ndarray | None = None,
     threshold: float | None = None,
 ) -> float:
-    """PROXY: micro-wrinkle density via a Frangi vesselness filter.
+    """Micro-wrinkle density via a Frangi vesselness filter.
 
-    The Frangi/Hessian filter highlights elongated line-like structures
-    (fine wrinkles/creases); their area fraction is a dryness-related proxy.
+    The Frangi/Hessian filter highlights elongated line-like structures (fine
+    wrinkles/creases). Extracted and reported, but outside the pore composite:
+    pores are round pits, and this filter is built to suppress exactly that in
+    favour of ridges.
 
     Parameters
     ----------

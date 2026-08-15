@@ -293,11 +293,11 @@ def test_openapi_example_is_a_request_that_would_succeed(client):
 
 def test_analyze_stores_flat_scores(client, image_server):
     result = _analyze_result(client, "/analyze", {"image_url": f"{image_server}/face.png"})
-    for metric in ("pigmentation", "erythema", "hydration"):
+    for metric in ("pigmentation", "erythema", "pores"):
         assert 0.0 <= result[metric] <= 100.0
         assert 0.0 <= result["confidence"][metric] <= 1.0
     # Scores only: no warnings / disclaimer / elapsed_ms / version.
-    assert set(result) == {"pigmentation", "erythema", "hydration", "confidence"}
+    assert set(result) == {"pigmentation", "erythema", "pores", "confidence"}
 
 
 def test_analyze_and_diary_share_the_same_envelope(client, image_server):
@@ -306,8 +306,8 @@ def test_analyze_and_diary_share_the_same_envelope(client, image_server):
     full = _analyze_result(client, "/analyze", url)
     diary = _analyze_result(client, "/analyze/diary", url)
 
-    full_scores = {"pigmentation", "erythema", "hydration"}
-    diary_scores = {"skin_tone", "dryness", "redness"}
+    full_scores = {"pigmentation", "erythema", "pores"}
+    diary_scores = {"skin_tone", "pores", "redness"}
     assert set(full) - full_scores == set(diary) - diary_scores
     assert set(full["confidence"]) == full_scores
     assert set(diary["confidence"]) == diary_scores
@@ -327,13 +327,13 @@ def test_unknown_result_key_is_404(client):
     assert resp.json()["error"]["code"] == "result_not_found"
 
 
-def _report_stub(ita=None, hydration=70.0, erythema=35.0) -> SkinReport:
+def _report_stub(ita=None, pores=70.0, erythema=35.0) -> SkinReport:
     """Minimal SkinReport for exercising the diary-score mapping."""
     pig_features = {} if ita is None else {"ita": ita}
     return SkinReport(
         pigmentation=MetricScore(score=50.0, confidence=0.8, raw_features=pig_features),
         erythema=MetricScore(score=erythema, confidence=0.7),
-        hydration=MetricScore(score=hydration, confidence=0.6, is_estimate=True),
+        pores=MetricScore(score=pores, confidence=0.6),
         calibration_status="none",
         fitzpatrick_estimate=3,
     )
@@ -341,14 +341,15 @@ def _report_stub(ita=None, hydration=70.0, erythema=35.0) -> SkinReport:
 
 def test_diary_mapping_orients_and_scales_each_score():
     diary = DiaryAnalyzeResponse.from_report(
-        _report_stub(ita=34.5, hydration=70.0, erythema=35.0)
+        _report_stub(ita=34.5, pores=70.0, erythema=35.0)
     )
     # ITA 34.5 sits (34.5+30)/85 of the way from dark to very light.
     assert diary.skin_tone == pytest.approx(round(10.0 * 64.5 / 85.0, 1))
-    # hydration 70 (moist) -> dryness 3.0; erythema 35 -> redness 3.5.
-    assert diary.dryness == pytest.approx(3.0)
+    # pores 70 -> 7.0; erythema 35 -> redness 3.5. Both are straight /10, in
+    # the same direction as the 0-100 score: no metric is flipped any more.
+    assert diary.pores == pytest.approx(7.0)
     assert diary.redness == pytest.approx(3.5)
-    assert diary.confidence == {"skin_tone": 0.8, "dryness": 0.6, "redness": 0.7}
+    assert diary.confidence == {"skin_tone": 0.8, "pores": 0.6, "redness": 0.7}
 
 
 @pytest.mark.parametrize("ita,expected", [(55.0, 10.0), (-30.0, 0.0), (90.0, 10.0), (-80.0, 0.0)])
@@ -365,19 +366,17 @@ def test_diary_mapping_survives_a_missing_ita():
 
 def test_analyze_diary_stores_scores(client, image_server):
     result = _analyze_result(client, "/analyze/diary", {"image_url": f"{image_server}/face.png"})
-    for field in ("skin_tone", "dryness", "redness"):
+    for field in ("skin_tone", "pores", "redness"):
         assert 0.0 <= result[field] <= 10.0
         assert 0.0 <= result["confidence"][field] <= 1.0
-    assert set(result) == {"skin_tone", "dryness", "redness", "confidence"}
+    assert set(result) == {"skin_tone", "pores", "redness", "confidence"}
 
 
 def test_diary_is_consistent_with_the_full_scores(client, image_server):
     url = {"image_url": f"{image_server}/face.png"}
     full = _analyze_result(client, "/analyze", url)
     diary = _analyze_result(client, "/analyze/diary", url)
-    assert diary["dryness"] == pytest.approx(
-        round((100.0 - full["hydration"]) / 10.0, 1), abs=0.05
-    )
+    assert diary["pores"] == pytest.approx(round(full["pores"] / 10.0, 1), abs=0.05)
     assert diary["redness"] == pytest.approx(round(full["erythema"] / 10.0, 1), abs=0.05)
 
 

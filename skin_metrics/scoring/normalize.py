@@ -50,7 +50,7 @@ def composite_raw(
     Parameters
     ----------
     metric : str
-        One of ``"pigmentation"``, ``"erythema"``, ``"hydration"``.
+        One of ``"pigmentation"``, ``"erythema"``, ``"pores"``.
     subfeatures : dict
         Sub-feature name -> value. Only keys listed in the config weights are
         used; missing keys contribute ``0`` (their weight is skipped and the

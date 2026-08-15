@@ -4,11 +4,11 @@ Each sample bundles:
 
 - an ROI crop image tensor (``3 x H x W``),
 - a Phase-1 **physics feature vector** (the aggregated raw features),
-- multitask regression labels (pigmentation / erythema / hydration),
+- multitask regression labels (pigmentation / erythema / pores),
 - a Fitzpatrick type (for per-type reporting / reference splitting),
 - an illumination-condition bucket (for the domain-adversarial head).
 
-Labels come from a CSV of instrument ground truth (Corneometer for hydration,
+Labels come from a CSV of instrument ground truth (a pore count for pores,
 Mexameter for melanin/erythema). Because such labels are often unavailable, a
 :class:`DummyLabelGenerator` produces a fully self-consistent synthetic dataset
 so the entire training loop can be validated immediately, with **no labels and
@@ -43,7 +43,7 @@ PHYSICS_FEATURE_NAMES: tuple[str, ...] = (
 )
 PHYSICS_DIM = len(PHYSICS_FEATURE_NAMES)
 
-TARGET_NAMES: tuple[str, ...] = ("pigmentation", "erythema", "hydration")
+TARGET_NAMES: tuple[str, ...] = ("pigmentation", "erythema", "pores")
 N_ILLUMINATION_BUCKETS = 4
 
 
@@ -114,7 +114,7 @@ def load_label_csv(path: str | Path) -> list[dict[str, Any]]:
 
     Expected columns (missing target columns are allowed for ranking mode):
     ``image_path``, physics feature columns (any of :data:`PHYSICS_FEATURE_NAMES`),
-    ``pigmentation``, ``erythema``, ``hydration``, ``fitzpatrick``,
+    ``pigmentation``, ``erythema``, ``pores``, ``fitzpatrick``,
     ``illumination`` (optional).
 
     Parameters

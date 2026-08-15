@@ -83,8 +83,10 @@ class RoiLabels:
     Attributes
     ----------
     moisture : float or None
-        Corneometer reading in arbitrary units (~24-84 in this cohort). The
-        regression target for the hydration metric.
+        Corneometer reading in arbitrary units (~24-84 in this cohort).
+        Parsed and carried through to the CSV, but no shipped metric uses it:
+        capacitance has no reliable optical counterpart, so the moisture
+        metric it once fed reached only +0.32 and was dropped for pores.
     pigmentation_grade : int or None
         Expert ordinal pigmentation grade, 0 (none) to 5 (severe). Absent for
         ``chin``.

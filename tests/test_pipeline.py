@@ -13,61 +13,64 @@ def test_analyze_returns_valid_report(synthetic_image, synthetic_landmarks):
     report = analyze(synthetic_image, landmarks=synthetic_landmarks)
     assert isinstance(report, SkinReport)
 
-    for metric in (report.pigmentation, report.erythema, report.hydration):
+    for metric in (report.pigmentation, report.erythema, report.pores):
         assert 0.0 <= metric.score <= 100.0
         assert 0.0 <= metric.confidence <= 1.0
 
-    # Hydration is always flagged as an estimate.
-    assert report.hydration.is_estimate is True
+    # Every current metric reads something the camera resolves, so none of them
+    # is a proxy.
+    assert report.pores.is_estimate is False
     assert report.pigmentation.is_estimate is False
 
     assert 1 <= report.fitzpatrick_estimate <= 6
     assert report.calibration_status in ("reference", "grayworld", "none")
     assert report.roi_breakdown  # at least one ROI
-    assert any("not a moisture measurement" in w for w in report.warnings)
+    assert any("not a count" in w for w in report.warnings)
 
 
-def test_hydration_is_reported_as_moisture_not_dryness(
+def test_report_inverted_flips_only_the_named_metric(
     synthetic_image, synthetic_landmarks
 ):
-    """A field called `hydration` must rise with moisture, not with dryness.
+    """`scoring.report_inverted` is empty, and still has to work when used.
 
-    Everything upstream measures dryness; `scoring.report_inverted` flips the
-    finished percentile. Without it "수분력 85점" would mean *very dry*.
+    No current metric is named for the good end of its scale, so nothing is
+    flipped. The mechanism stays because the next such metric needs it, and an
+    un-flipped one is silently wrong rather than broken -- a "수분력 85점" read
+    off a dryness index tells the user the opposite of the truth.
     """
     import copy
 
     from skin_metrics.config import load_config
 
     config = load_config()
-    assert "hydration" in config["scoring"]["report_inverted"]
+    assert config["scoring"]["report_inverted"] == []
     report = analyze(synthetic_image, landmarks=synthetic_landmarks, config=config)
 
-    straight = copy.deepcopy(config)
-    straight["scoring"]["report_inverted"] = []
-    dryness = analyze(synthetic_image, landmarks=synthetic_landmarks, config=straight)
+    flipped_cfg = copy.deepcopy(config)
+    flipped_cfg["scoring"]["report_inverted"] = ["pores"]
+    flipped = analyze(synthetic_image, landmarks=synthetic_landmarks, config=flipped_cfg)
 
-    assert report.hydration.score == pytest.approx(100.0 - dryness.hydration.score)
-    # The metrics that are honestly named are left alone.
-    assert report.pigmentation.score == dryness.pigmentation.score
-    assert report.erythema.score == dryness.erythema.score
+    assert flipped.pores.score == pytest.approx(100.0 - report.pores.score)
+    # Metrics not named in the list are left alone.
+    assert flipped.pigmentation.score == report.pigmentation.score
+    assert flipped.erythema.score == report.erythema.score
 
 
-def test_hydration_aggregates_over_the_cheeks_only(synthetic_image, synthetic_landmarks):
-    """Hydration is calibrated on cheek Corneometer readings, so only cheeks feed it."""
+def test_pores_aggregate_over_the_cheeks_only(synthetic_image, synthetic_landmarks):
+    """The instrument counted pores on the cheeks, so only cheeks feed the score."""
     from skin_metrics.config import load_config
     from skin_metrics.pipeline import extract_raw
 
     config = load_config()
-    assert config["composite"]["hydration"]["rois"] == ["left_cheek", "right_cheek"]
+    assert config["composite"]["pores"]["rois"] == ["left_cheek", "right_cheek"]
 
     raw = extract_raw(synthetic_image, landmarks=synthetic_landmarks, config=config)
     cheeks = [r for r in ("left_cheek", "right_cheek") if r in raw.roi_features]
     assert cheeks, "fixture must produce at least one cheek ROI"
 
-    for key, value in raw.aggregate["hydration"].items():
+    for key, value in raw.aggregate["pores"].items():
         expected = np.average(
-            [raw.roi_features[r]["hydration"][key] for r in cheeks],
+            [raw.roi_features[r]["pores"][key] for r in cheeks],
             weights=[raw.roi_weights[r] for r in cheeks],
         )
         assert value == np.float64(expected)
@@ -82,13 +85,13 @@ def test_hydration_aggregates_over_the_cheeks_only(synthetic_image, synthetic_la
     assert raw.aggregate["pigmentation"][key] == np.float64(expected)
 
 
-def test_hydration_falls_back_when_no_cheek_survives(synthetic_image, synthetic_landmarks):
+def test_pores_fall_back_when_no_cheek_survives(synthetic_image, synthetic_landmarks):
     """Losing both cheeks degrades to the other ROIs, loudly."""
     from skin_metrics.pipeline import _aggregation_rois
 
-    config = {"composite": {"hydration": {"rois": ["left_cheek", "right_cheek"]}}}
+    config = {"composite": {"pores": {"rois": ["left_cheek", "right_cheek"]}}}
     warnings: list[str] = []
-    names = _aggregation_rois("hydration", ["forehead", "chin"], config, warnings)
+    names = _aggregation_rois("pores", ["forehead", "chin"], config, warnings)
     assert names == ["forehead", "chin"]
     assert any("less reliable" in w for w in warnings)
 

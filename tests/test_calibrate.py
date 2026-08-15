@@ -22,7 +22,7 @@ from skin_metrics.scoring.normalize import (
 # --- helpers ---------------------------------------------------------------
 
 
-def _roi_row(key, roi, split, moisture, contrast, grade=None, **extra):
+def _roi_row(key, roi, split, pore_count, contrast, grade=None, **extra):
     """One synthetic per-ROI feature row."""
     row = {
         "key": key,
@@ -30,15 +30,15 @@ def _roi_row(key, roi, split, moisture, contrast, grade=None, **extra):
         "split": split,
         "device": "phone",
         "subject": key.split("/")[-1],
-        "label_moisture": moisture,
+        "label_pore_count": pore_count,
         "label_pigmentation_grade": grade,
-        "f_hydration_scaling_index": 0.001 + 0.0001 * contrast,
-        "f_hydration_glcm_contrast": contrast,
-        "f_hydration_glcm_correlation": 0.95,
-        "f_hydration_glcm_energy": 0.26,
-        "f_hydration_lbp_uniformity": 0.2,
-        "f_hydration_wrinkle_density": 0.07,
-        "f_hydration_specular_ratio": 0.002,
+        "f_pores_scaling_index": 0.001 + 0.0001 * contrast,
+        "f_pores_glcm_contrast": contrast,
+        "f_pores_glcm_correlation": 0.95,
+        "f_pores_glcm_energy": 0.26,
+        "f_pores_lbp_uniformity": 0.2,
+        "f_pores_wrinkle_density": 0.07,
+        "f_pores_specular_ratio": 0.002,
     }
     row.update(extra)
     return row
@@ -63,36 +63,36 @@ def test_trimmed_moments_empty_is_safe():
 
 
 def test_ridge_recovers_a_linear_relationship():
-    """A moisture label that is an exact linear function of one feature."""
+    """A pore-count label that is an exact linear function of one feature."""
     rng = np.random.default_rng(0)
     rows = []
     for i in range(300):
         contrast = float(rng.uniform(0.2, 2.0))
-        # moisture falls as texture contrast rises (drier skin = rougher)
-        rows.append(_roi_row(f"train/{i:04d}", "forehead", "train",
-                             moisture=80.0 - 15.0 * contrast, contrast=contrast))
+        # more pores as texture contrast rises
+        rows.append(_roi_row(f"train/{i:04d}", "left_cheek", "train",
+                             pore_count=200.0 + 400.0 * contrast, contrast=contrast))
 
-    model = cfit.fit_ridge(rows, cfit.HYDRATION_FEATURES, "label_moisture")
+    model = cfit.fit_ridge(rows, cfit.PORE_FEATURES, "label_pore_count")
     assert model is not None
 
-    stats = cfit.evaluate_ridge(model, rows, "label_moisture")
+    stats = cfit.evaluate_ridge(model, rows, "label_pore_count")
     assert stats["pearson"] > 0.98
     assert stats["mae"] < stats["baseline_mae"]
 
 
 def test_fit_ridge_declines_tiny_samples():
-    rows = [_roi_row(f"k{i}", "forehead", "train", 60.0, 1.0) for i in range(10)]
-    assert cfit.fit_ridge(rows, cfit.HYDRATION_FEATURES, "label_moisture") is None
+    rows = [_roi_row(f"k{i}", "left_cheek", "train", 600.0, 1.0) for i in range(10)]
+    assert cfit.fit_ridge(rows, cfit.PORE_FEATURES, "label_pore_count") is None
 
 
 def test_predict_ridge_returns_none_on_missing_feature():
     rows = [
-        _roi_row(f"k{i}", "forehead", "train", 60.0 + i % 7, 0.5 + 0.01 * i)
+        _roi_row(f"k{i}", "left_cheek", "train", 600.0 + i % 7, 0.5 + 0.01 * i)
         for i in range(120)
     ]
-    model = cfit.fit_ridge(rows, cfit.HYDRATION_FEATURES, "label_moisture")
+    model = cfit.fit_ridge(rows, cfit.PORE_FEATURES, "label_pore_count")
     incomplete = dict(rows[0])
-    del incomplete["f_hydration_glcm_contrast"]
+    del incomplete["f_pores_glcm_contrast"]
     assert cfit.predict_ridge(model, incomplete) is None
 
 
@@ -106,7 +106,7 @@ def test_accept_model_requires_a_real_improvement():
 
 
 def test_accept_model_rejects_a_barely_better_than_mean_model():
-    """The hydration case: statistically real, practically useless."""
+    """Statistically real, practically useless -- the moisture metric's fate."""
     weak = {"n": 800, "pearson": 0.185, "mae": 7.566, "baseline_mae": 7.741}
     accepted, reason = cfit.accept_model(weak)
     assert not accepted
@@ -193,28 +193,33 @@ def test_fit_composite_weights_recovers_the_driving_feature():
 def test_fit_composite_weights_honours_an_inverted_target():
     """A sign=-1 target must not come back as sign-flipped weights.
 
-    Hydration scores dryness while the Corneometer reads moisture, so the fit
-    has to regress on ``sign * target``. Without that the returned weights rank
-    held-out subjects backwards and the gate rejects them -- which is exactly
-    how hydration failed on every device before this was fixed.
+    No shipped metric currently needs this -- both targets in
+    :data:`COMPOSITE_TARGET_SIGN` are +1 -- but any instrument that reads the
+    *good* end of a scale does, and the failure is silent: the fit returns
+    exactly inverted weights and the gate then rejects them as
+    "anti-correlated" rather than as a bug. That is how the moisture metric
+    failed on every device before the ``sign`` argument existed, so the
+    mechanism is pinned here even while it is unused.
     """
     rng = np.random.default_rng(11)
     rows = []
     for i in range(400):
-        dryness = float(rng.uniform(0.0, 1.0))
-        rows.append(_face_row(f"train/{i:04d}", "train", dryness, 0.0))
-        # More dryness -> less moisture.
-        rows[-1]["label_moisture"] = 100.0 - 50.0 * dryness
+        severity = float(rng.uniform(0.0, 1.0))
+        rows.append(_face_row(f"train/{i:04d}", "train", severity, 0.0))
+        # A hypothetical instrument reading the healthy end of the scale: it
+        # falls as the condition the score measures gets worse.
+        rows[-1]["label_inverted_instrument"] = 100.0 - 50.0 * severity
 
     anchors = {"spot_count": {"mean": 0.5, "std": 0.25}}
     plain = cfit.fit_composite_weights(
-        rows, "pigmentation", ["spot_count"], "label_moisture", anchors
+        rows, "pigmentation", ["spot_count"], "label_inverted_instrument", anchors
     )
     signed = cfit.fit_composite_weights(
-        rows, "pigmentation", ["spot_count"], "label_moisture", anchors, sign=-1.0
+        rows, "pigmentation", ["spot_count"], "label_inverted_instrument", anchors,
+        sign=-1.0,
     )
-    assert plain["spot_count"] < 0        # tracks moisture
-    assert signed["spot_count"] > 0       # tracks dryness, which is what we score
+    assert plain["spot_count"] < 0        # tracks the instrument
+    assert signed["spot_count"] > 0       # tracks severity, which is what we score
 
 
 def test_fit_composite_weights_declines_tiny_samples():
@@ -294,7 +299,7 @@ def test_score_from_raw_prefers_quantiles_over_normal_cdf():
     """An empirical grid must win when present; the Gaussian is the fallback."""
     config = {
         "reference": {
-            "hydration": {
+            "pores": {
                 "default": {
                     "mean": 0.0,
                     "std": 1.0,
@@ -305,10 +310,10 @@ def test_score_from_raw_prefers_quantiles_over_normal_cdf():
         },
         "scoring": {"clip_z": 4.0},
     }
-    empirical = score_from_raw(5.0, "hydration", 3, config)
+    empirical = score_from_raw(5.0, "pores", 3, config)
 
-    del config["reference"]["hydration"]["default"]["quantiles"]
-    gaussian = score_from_raw(5.0, "hydration", 3, config)
+    del config["reference"]["pores"]["default"]["quantiles"]
+    gaussian = score_from_raw(5.0, "pores", 3, config)
 
     assert empirical != pytest.approx(gaussian)
     assert 0.0 <= empirical <= 100.0
@@ -326,13 +331,13 @@ def test_score_falls_back_to_default_bucket_for_unseen_fitzpatrick():
 
 
 def test_flatten_features_uses_the_csv_column_names():
-    flat = flatten_features({"hydration": {"glcm_contrast": 0.8}})
-    assert flat == {"f_hydration_glcm_contrast": 0.8}
+    flat = flatten_features({"pores": {"glcm_contrast": 0.8}})
+    assert flat == {"f_pores_glcm_contrast": 0.8}
 
 
 def test_predict_instrument_skips_rois_the_model_was_not_fitted_on():
     model = {
-        "features": ["f_hydration_glcm_contrast"],
+        "features": ["f_pores_glcm_contrast"],
         "feature_mean": [1.0],
         "feature_std": [1.0],
         "coef": [10.0],
@@ -340,15 +345,15 @@ def test_predict_instrument_skips_rois_the_model_was_not_fitted_on():
         "applies_to_rois": ["forehead"],
     }
     roi_features = {
-        "forehead": {"hydration": {"glcm_contrast": 2.0}},   # -> 50 + 10*1 = 60
-        "nose": {"hydration": {"glcm_contrast": 100.0}},     # must be ignored
+        "forehead": {"pores": {"glcm_contrast": 2.0}},   # -> 50 + 10*1 = 60
+        "nose": {"pores": {"glcm_contrast": 100.0}},     # must be ignored
     }
     assert predict_instrument(model, roi_features) == pytest.approx(60.0)
 
 
 def test_predict_instrument_weights_by_roi_area():
     model = {
-        "features": ["f_hydration_glcm_contrast"],
+        "features": ["f_pores_glcm_contrast"],
         "feature_mean": [0.0],
         "feature_std": [1.0],
         "coef": [1.0],
@@ -356,8 +361,8 @@ def test_predict_instrument_weights_by_roi_area():
         "applies_to_rois": ["forehead", "chin"],
     }
     roi_features = {
-        "forehead": {"hydration": {"glcm_contrast": 10.0}},
-        "chin": {"hydration": {"glcm_contrast": 20.0}},
+        "forehead": {"pores": {"glcm_contrast": 10.0}},
+        "chin": {"pores": {"glcm_contrast": 20.0}},
     }
     weights = {"forehead": 3.0, "chin": 1.0}
     assert predict_instrument(model, roi_features, weights) == pytest.approx(12.5)
@@ -365,14 +370,14 @@ def test_predict_instrument_weights_by_roi_area():
 
 def test_predict_instrument_returns_none_without_usable_rois():
     model = {
-        "features": ["f_hydration_glcm_contrast"],
+        "features": ["f_pores_glcm_contrast"],
         "feature_mean": [0.0],
         "feature_std": [1.0],
         "coef": [1.0],
         "intercept": 0.0,
         "applies_to_rois": ["forehead"],
     }
-    assert predict_instrument(model, {"nose": {"hydration": {"glcm_contrast": 1.0}}}) is None
+    assert predict_instrument(model, {"nose": {"pores": {"glcm_contrast": 1.0}}}) is None
 
 
 # --- profile merging -------------------------------------------------------
@@ -381,22 +386,22 @@ def test_predict_instrument_returns_none_without_usable_rois():
 def test_merge_profile_overlays_anchors_and_models():
     config = {
         "composite": {
-            "hydration": {
+            "pores": {
                 "weights": {"glcm_contrast": 1.0},
                 "anchors": {"glcm_contrast": {"mean": 50.0, "std": 30.0}},
             }
         }
     }
     profile = {
-        "composite_anchors": {"hydration": {"glcm_contrast": {"mean": 0.8, "std": 0.2}}},
-        "reference": {"hydration": {"default": {"mean": 0.0, "std": 1.0}}},
-        "supervised": {"hydration": {"target": "corneometer_moisture"}},
+        "composite_anchors": {"pores": {"glcm_contrast": {"mean": 0.8, "std": 0.2}}},
+        "reference": {"pores": {"default": {"mean": 0.0, "std": 1.0}}},
+        "supervised": {"pores": {"target": "instrument_pore_count"}},
         "provenance": {"profile": "test_cohort"},
     }
     merged = merge_profile(config, profile)
 
-    assert merged["composite"]["hydration"]["anchors"]["glcm_contrast"]["mean"] == 0.8
-    assert merged["supervised"]["hydration"]["target"] == "corneometer_moisture"
+    assert merged["composite"]["pores"]["anchors"]["glcm_contrast"]["mean"] == 0.8
+    assert merged["supervised"]["pores"]["target"] == "instrument_pore_count"
     assert merged["provenance"]["profile"] == "test_cohort"
 
 
@@ -574,8 +579,8 @@ def test_a_supervised_profile_reaches_the_report(synthetic_image, synthetic_land
     assert report.calibration_profile == "unit_test_profile"
 
     # Metrics without a model stay on the composite path.
-    assert report.hydration.calibrated is False
-    assert report.hydration.predicted_value is None
+    assert report.pores.calibrated is False
+    assert report.pores.predicted_value is None
 
 
 def test_an_inapplicable_model_degrades_to_the_composite(

@@ -29,7 +29,7 @@ from .detection.face import (
     scale_factor_for,
 )
 from .features import erythema as ery
-from .features import hydration_proxy as hyd
+from .features import pores as por
 from .features import pigmentation as pig
 from .scoring.normalize import (
     composite_raw,
@@ -63,7 +63,7 @@ def _roi_features(
     roi: ROIResult,
     config: dict[str, Any],
 ) -> dict[str, dict[str, float]]:
-    """Compute pigmentation / erythema / hydration sub-features for one ROI."""
+    """Compute pigmentation / erythema / pore sub-features for one ROI."""
     vmask = roi.valid_mask
     lstar = lab[..., 0]
     bstar = lab[..., 2]
@@ -99,28 +99,28 @@ def _roi_features(
         "hemoglobin_ok": float(bool(hb["separation_ok"])),
     }
 
-    # --- hydration (proxy) ---
+    # --- pores (surface texture) ---
     gray = np.clip(lstar / 100.0, 0.0, 1.0)
     gray_crop, mask_crop = _bbox_crop(gray, vmask)
-    tex = hyd.texture_features_proxy(gray_crop, mask=mask_crop)
-    spec = hyd.specular_ratio_proxy(
+    tex = por.texture_stats(gray_crop, mask=mask_crop)
+    spec = por.specular_ratio(
         rgb_linear,
         mask=vmask,
-        v_min=config["hydration_proxy"]["specular_v_min"],
-        s_max=config["hydration_proxy"]["specular_s_max"],
+        v_min=config["pores"]["specular_v_min"],
+        s_max=config["pores"]["specular_s_max"],
     )
-    hydration = {
+    pore = {
         "specular_ratio": spec,
         "specular_inv": -spec,
         "glcm_contrast": tex["glcm_contrast"],
         "glcm_correlation": tex["glcm_correlation"],
         "glcm_energy": tex["glcm_energy"],
         "lbp_uniformity": tex["lbp_uniformity"],
-        "scaling_index": hyd.scaling_index_proxy(gray_crop, mask=mask_crop),
-        "wrinkle_density": hyd.micro_wrinkle_density_proxy(gray_crop, mask=mask_crop),
+        "scaling_index": por.scaling_index(gray_crop, mask=mask_crop),
+        "wrinkle_density": por.micro_wrinkle_density(gray_crop, mask=mask_crop),
     }
 
-    return {"pigmentation": pigmentation, "erythema": erythema, "hydration": hydration}
+    return {"pigmentation": pigmentation, "erythema": erythema, "pores": pore}
 
 
 def _normalize_face_scale(
@@ -200,15 +200,15 @@ def _aggregation_rois(
     """ROIs that feed a metric's face-level aggregate.
 
     A metric may declare ``composite.<metric>.rois`` to restrict aggregation to
-    the sites where its signal was actually measured -- hydration is validated
-    against a Corneometer reading taken on the cheeks, and averaging in
+    the sites where its signal was actually measured -- pores are validated
+    against an instrument count taken on the cheeks, and averaging in
     forehead/nose/chin texture only dilutes it. Metrics without the key keep
     every valid ROI.
 
     Parameters
     ----------
     metric : str
-        Metric name, e.g. ``"hydration"``.
+        Metric name, e.g. ``"pores"``.
     valid : list of str
         ROIs that passed the valid-pixel gate.
     config : dict
@@ -379,7 +379,7 @@ def extract_raw(
         warnings.append(
             f"Face is under-resolved (eye span {native_span:.0f}px < "
             f"{target_span:.0f}px target); texture-based features "
-            "(hydration) are less reliable. Move closer or use a higher-"
+            "(pores) are less reliable. Move closer or use a higher-"
             "resolution photo."
         )
 
@@ -416,7 +416,7 @@ def extract_raw(
         wts = [roi_weights[n] for n in names]
         return _weighted_mean(vals, wts)
 
-    agg: dict[str, dict[str, float]] = {"pigmentation": {}, "erythema": {}, "hydration": {}}
+    agg: dict[str, dict[str, float]] = {"pigmentation": {}, "erythema": {}, "pores": {}}
     for metric in agg:
         names = _aggregation_rois(metric, list(valid_rois), config, warnings)
         sample_keys = next(iter(roi_feats.values()))[metric].keys()
@@ -475,7 +475,7 @@ def _score_metric(
     Parameters
     ----------
     metric : str
-        ``"pigmentation"`` | ``"erythema"`` | ``"hydration"``.
+        ``"pigmentation"`` | ``"erythema"`` | ``"pores"``.
     raw : RawExtraction
         Extracted features for the image.
     config : dict
@@ -493,12 +493,13 @@ def _score_metric(
         """Percentile-map the driver, then orient it for the reader.
 
         Everything upstream -- features, composite weights, the fitted quantile
-        grids -- works in "more pronounced condition" units, which for hydration
-        means DRYNESS. `scoring.report_inverted` flips the finished percentile
-        for metrics whose public name reads the other way round, so a field
-        called `hydration` means what a reader expects it to mean. Flipping here
-        and not earlier keeps the calibration and its validation numbers in the
-        single orientation they were fitted in.
+        grids -- works in "more pronounced condition" units, and all three
+        current metrics are reported that way round, so `scoring.report_inverted`
+        is empty and this is a straight pass-through. It stays because a metric
+        named for the good end of its scale (the moisture proxy that used to be
+        here) has to be flipped somewhere, and flipping here rather than earlier
+        keeps the calibration and its validation numbers in the single
+        orientation they were fitted in.
         """
         score = score_from_raw(driver, metric, raw.fitzpatrick, config)
         inverted = (config.get("scoring") or {}).get("report_inverted") or ()
@@ -514,7 +515,8 @@ def _score_metric(
         predicted = predict_instrument(model, raw.roi_features)
         if predicted is not None:
             # `score_sign` orients the driver so higher always means "more
-            # pronounced condition" (moisture is inverted: drier scores higher).
+            # pronounced condition"; it is -1 for a target that runs the other
+            # way (a moisture reading, say), +1 for a pore or spot count.
             driver = float(model.get("score_sign", 1.0)) * predicted
             return (
                 _finish(driver),
@@ -559,7 +561,7 @@ def analyze(
     Returns
     -------
     SkinReport
-        Pigmentation / erythema / hydration scores, ROI breakdown, calibration
+        Pigmentation / erythema / pore scores, ROI breakdown, calibration
         status, Fitzpatrick estimate, and warnings.
 
     Raises
@@ -587,7 +589,7 @@ def analyze(
     # 8. scores -------------------------------------------------------------
     scores: dict[str, float] = {}
     predictions: dict[str, _Prediction] = {}
-    for metric in ("pigmentation", "erythema", "hydration"):
+    for metric in ("pigmentation", "erythema", "pores"):
         scores[metric], predictions[metric] = _score_metric(
             metric, raw, config, warnings
         )
@@ -604,20 +606,22 @@ def analyze(
     if not hemo_ok:
         warnings.append("Hemoglobin ICA separation was unreliable for some ROIs.")
 
-    # Texture features drive hydration, so an under-resolved face hurts it most.
-    hyd_conf = common_conf * (0.6 if raw.under_resolved else 1.0)
+    # Texture features drive the pore score, so an under-resolved face hurts it
+    # most: pore openings are the first detail a downscale destroys.
+    pore_conf = common_conf * (0.6 if raw.under_resolved else 1.0)
 
-    if predictions["hydration"].calibrated:
+    if predictions["pores"].calibrated:
         warnings.append(
-            "Hydration is an ESTIMATE of a Corneometer reading regressed from "
-            "surface optics/texture, not a moisture measurement."
+            "The predicted pore count is regressed from cheek texture and is "
+            "reliable as a ranking, not a count: held-out error beats predicting "
+            "the cohort mean by only ~14%. Use the 0-100 score, not the raw "
+            "number."
         )
     else:
         warnings.append(
-            "Hydration is a PROXY estimate from cheek surface texture, not a "
-            "moisture measurement: a higher score means this face ranks as "
-            "moister than the reference cohort, not that a given amount of "
-            "water was measured."
+            "Pore score is a ranking against the reference cohort, not a count: "
+            "a higher score means this face shows more pore texture than the "
+            "cohort, measured on the cheeks only."
         )
     if not predictions["erythema"].calibrated:
         warnings.append(
@@ -650,9 +654,12 @@ def analyze(
     report = SkinReport(
         pigmentation=_metric_score("pigmentation", common_conf, False),
         erythema=_metric_score("erythema", ery_conf, False),
-        # Hydration is inferred from surface optics, never measured, so it
-        # stays flagged as an estimate even once calibrated.
-        hydration=_metric_score("hydration", hyd_conf, True),
+        # Not an estimate: pore openings are resolved in the image itself, and
+        # the score is validated against an instrument count (held-out Spearman
+        # +0.58, stable across all three capture devices). This is the one place
+        # the metric it replaced had to say otherwise -- moisture was inferred
+        # from optics that barely encode it, so it carried is_estimate=True.
+        pores=_metric_score("pores", pore_conf, False),
         roi_breakdown={
             name: {
                 "valid_ratio": round(valid_rois[name], 3),

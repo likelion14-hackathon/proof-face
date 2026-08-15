@@ -21,15 +21,16 @@ class MetricScore(BaseModel):
     raw_features : dict
         The underlying physics feature values.
     is_estimate : bool
-        ``True`` for proxy metrics that are not a direct measurement
-        (always ``True`` for hydration).
+        ``True`` for proxy metrics that are not a direct measurement. All three
+        current metrics measure something the camera actually resolves, so all
+        three are ``False``.
     calibrated : bool
         ``True`` when the score came from a model fitted against real
         instrument readings, ``False`` when it came from the unsupervised
         composite of hand-weighted sub-features.
     predicted_value : float, optional
         The predicted instrument reading behind the score, when one exists
-        (e.g. Corneometer moisture in a.u., expert pigmentation grade 0-5).
+        (e.g. instrument pore count, expert pigmentation grade 0-5).
     predicted_units : str, optional
         Units of ``predicted_value``.
     """
@@ -55,7 +56,7 @@ class FaceScale(BaseModel):
         (``1.0`` = none).
     under_resolved : bool
         ``True`` when the face was smaller than the normalisation target, so
-        texture-derived features (hydration) are less reliable.
+        texture-derived features (pores) are less reliable.
     """
 
     eye_span_px: float = 0.0
@@ -68,7 +69,7 @@ class SkinReport(BaseModel):
 
     pigmentation: MetricScore
     erythema: MetricScore
-    hydration: MetricScore
+    pores: MetricScore
     roi_breakdown: dict[str, dict[str, Any]] = Field(default_factory=dict)
     calibration_status: Literal["reference", "grayworld", "none"]
     fitzpatrick_estimate: int = Field(ge=1, le=6)

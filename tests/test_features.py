@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from skin_metrics.features import erythema as ery
-from skin_metrics.features import hydration_proxy as hyd
+from skin_metrics.features import pores as por
 from skin_metrics.features import pigmentation as pig
 
 
@@ -104,30 +104,30 @@ def test_hemoglobin_map_too_few_pixels():
     assert res["separation_ok"] is False
 
 
-# --- hydration proxy -------------------------------------------------------
+# --- pores / surface texture -----------------------------------------------
 def test_specular_ratio_detects_bright_patch():
     img = np.full((30, 30, 3), 0.3, dtype=np.float64)  # matte
     img[0:10, 0:10] = 0.99  # bright, low-saturation -> specular
-    ratio = hyd.specular_ratio_proxy(img)
+    ratio = por.specular_ratio(img)
     assert 0.0 < ratio < 1.0
 
 
 def test_specular_ratio_empty_mask():
     img = np.full((10, 10, 3), 0.99)
-    assert hyd.specular_ratio_proxy(img, mask=np.zeros((10, 10), dtype=bool)) == 0.0
+    assert por.specular_ratio(img, mask=np.zeros((10, 10), dtype=bool)) == 0.0
 
 
 def test_texture_features_ranges():
     rng = np.random.default_rng(5)
     gray = rng.uniform(0, 1, size=(40, 40))
-    feats = hyd.texture_features_proxy(gray)
+    feats = por.texture_stats(gray)
     for key in ("glcm_contrast", "glcm_correlation", "glcm_energy", "lbp_uniformity"):
         assert key in feats and np.isfinite(feats[key])
     assert feats["glcm_energy"] >= 0.0
 
 
 def test_texture_features_tiny_input():
-    feats = hyd.texture_features_proxy(np.zeros((2, 2)))
+    feats = por.texture_stats(np.zeros((2, 2)))
     assert feats["glcm_contrast"] == 0.0
 
 
@@ -135,15 +135,15 @@ def test_scaling_index_higher_for_rough():
     smooth = np.full((40, 40), 0.5)
     rng = np.random.default_rng(9)
     rough = rng.uniform(0, 1, size=(40, 40))
-    assert hyd.scaling_index_proxy(rough) > hyd.scaling_index_proxy(smooth)
+    assert por.scaling_index(rough) > por.scaling_index(smooth)
 
 
 def test_micro_wrinkle_density_range():
     rng = np.random.default_rng(11)
     gray = rng.uniform(0, 1, size=(40, 40))
-    d = hyd.micro_wrinkle_density_proxy(gray)
+    d = por.micro_wrinkle_density(gray)
     assert 0.0 <= d <= 1.0
 
 
 def test_micro_wrinkle_tiny_input():
-    assert hyd.micro_wrinkle_density_proxy(np.zeros((3, 3))) == 0.0
+    assert por.micro_wrinkle_density(np.zeros((3, 3))) == 0.0

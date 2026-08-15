@@ -1,7 +1,7 @@
 [project]
 name = "skin-metrics"
 version = "0.1.0"
-description = "Camera-based skin metric quantification (pigmentation / erythema / hydration proxy)."
+description = "Camera-based skin metric quantification (pigmentation / erythema / pores)."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

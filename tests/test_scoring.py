@@ -72,7 +72,7 @@ def test_score_from_raw_bounds_and_monotonic(fixed_config):
 
 def test_shipped_config_scores_stay_in_range(config):
     """Whatever the current calibration is, scores must stay bounded."""
-    for metric in ("pigmentation", "erythema", "hydration"):
+    for metric in ("pigmentation", "erythema", "pores"):
         for raw in (-1e6, -1.0, 0.0, 1.0, 1e6):
             assert 0.0 <= score_from_raw(raw, metric, 3, config) <= 100.0
 
@@ -87,19 +87,19 @@ def test_score_metric_fitzpatrick_reference_differs(fixed_config):
 
 def test_score_metric_unknown_fitz_falls_back(config):
     # Type present in reference; ensure no KeyError for a normal call.
-    s = score_metric("hydration", {"scaling_index": 0.1}, 4, config)
+    s = score_metric("pores", {"scaling_index": 0.1}, 4, config)
     assert 0.0 <= s <= 100.0
 
 
 def test_compare_deltas_and_significance():
-    baseline = {"pigmentation": 50.0, "erythema": 40.0, "hydration": 30.0}
-    current = {"pigmentation": 58.0, "erythema": 41.0, "hydration": 30.0}
+    baseline = {"pigmentation": 50.0, "erythema": 40.0, "pores": 30.0}
+    current = {"pigmentation": 58.0, "erythema": 41.0, "pores": 30.0}
     res = compare(current, baseline, min_delta=5.0)
     assert res["pigmentation"]["delta"] == pytest.approx(8.0)
     assert res["pigmentation"]["significant"] is True
     assert res["pigmentation"]["direction"] == "up"
     assert res["erythema"]["significant"] is False
-    assert res["hydration"]["direction"] == "flat"
+    assert res["pores"]["direction"] == "flat"
 
 
 def test_schema_validates_and_dumps():
@@ -107,13 +107,13 @@ def test_schema_validates_and_dumps():
     report = SkinReport(
         pigmentation=ms,
         erythema=ms,
-        hydration=MetricScore(score=20.0, confidence=0.5, is_estimate=True),
+        pores=MetricScore(score=20.0, confidence=0.5, is_estimate=True),
         calibration_status="grayworld",
         fitzpatrick_estimate=3,
         warnings=["test"],
     )
     payload = report.model_dump()
-    assert payload["hydration"]["is_estimate"] is True
+    assert payload["pores"]["is_estimate"] is True
     assert "disclaimer" in payload
     assert payload["calibration_status"] == "grayworld"
 

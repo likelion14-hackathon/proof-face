@@ -42,8 +42,8 @@ calibration:
 # number of pixels. Every face is downscaled to `target_eye_span_px` between
 # the outer eye corners before feature extraction. Downscale only: a smaller
 # face is left alone (upsampling invents no detail and would read as smoother
-# = falsely hydrated) but is flagged `under_resolved`, which warns and lowers
-# the hydration confidence.
+# = falsely few pores) but is flagged `under_resolved`, which warns and lowers
+# the pore confidence.
 # In the calibration cohort, 86-100% of frontal photos per device clear 512px.
 normalization:
   enabled: true
@@ -63,8 +63,8 @@ fitzpatrick:
   ita_boundaries: [55.0, 41.0, 28.0, 10.0, -30.0]
   # ITA > 55 -> type 1 (very light); ITA <= -30 -> type 6 (dark)
 
-# --- specular / hydration proxy thresholds ---------------------------------
-hydration_proxy:
+# --- specular-highlight thresholds (features/pores.py) ---------------------
+pores:
   specular_v_min: 0.90
   specular_s_max: 0.20
 
@@ -72,22 +72,23 @@ hydration_proxy:
 # REPORTED 0-100 scores:
 #   pigmentation: higher = more/darker pigmentation   (higher = worse)
 #   erythema:     higher = more redness               (higher = worse)
-#   hydration:    higher = MORE MOISTURE              (higher = better)
-#                 NOTE: still a PROXY, is_estimate=True.
+#   pores:        higher = more visible pores         (higher = worse)
 #
-# Internally every metric is computed as a "condition index" (higher = more
-# pronounced), so hydration's driver, its composite weights and its fitted
-# quantile grid all measure DRYNESS. `report_inverted` flips the finished
-# percentile at the very last step for metrics whose public name reads the
-# other way round -- a field called `hydration` has to mean hydration, or a UI
-# showing "수분력 85점" tells the user they are moist when they are dry.
+# All three now run the same way round, so `report_inverted` is EMPTY. It is
+# kept because it is the only correct place to handle a metric whose public
+# name reads the opposite way: internally every metric is a "condition index"
+# (higher = more pronounced), and a field named for the good end of the scale
+# has to be flipped somewhere. The moisture metric that used to live here was
+# such a case -- a UI showing "수분력 85점" off an un-flipped dryness index
+# tells the user they are moist when they are dry.
 #
-# Flip at the end, never earlier: the calibration and every validation number
-# in calibration_profile.yaml are expressed in the dryness orientation, and
-# COMPOSITE_TARGET_SIGN in calibrate/fit.py depends on it.
+# If a metric ever needs it again: flip at the end, never earlier. The fitted
+# quantile grids and every validation number in calibration_profile.yaml are
+# expressed in the "more pronounced" orientation, and COMPOSITE_TARGET_SIGN in
+# calibrate/fit.py has to agree with it.
 scoring:
   clip_z: 4.0             # clip z-scores to +/- this before CDF mapping
-  report_inverted: [hydration]
+  report_inverted: []
 
 # --- reference distributions per metric, per Fitzpatrick type --------------
 # The pipeline builds one composite raw value per metric (see scoring/normalize.py),
@@ -110,7 +111,7 @@ reference:
     "4": { mean: -0.05, std: 0.98 }
     "5": { mean: -0.10, std: 0.95 }
     "6": { mean: -0.15, std: 0.95 }
-  hydration:
+  pores:
     default: { mean: 0.0, std: 1.0 }
     "1": { mean: 0.00, std: 1.00 }
     "2": { mean: 0.00, std: 1.00 }
@@ -159,40 +160,42 @@ composite:
     anchors:
       erythema_index: { mean: 8.0,  std: 6.0 }
       mean_a_star:    { mean: 12.0, std: 4.0 }
-  hydration:
-    # Aggregated over the CHEEKS ONLY. The Corneometer readings this metric is
-    # calibrated against were taken on forehead, cheeks and chin -- never the
-    # nose -- and only the cheeks actually track the instrument. Held-out rank
-    # agreement per ROI (scaling_index+wrinkle_density, n=107 subjects each):
-    #                phone    tablet   digital camera
-    #   left_cheek   +0.284   +0.232   +0.385
-    #   right_cheek  +0.253   +0.088   +0.258
-    #   forehead     +0.051   +0.187   +0.165
-    #   chin         +0.072   -0.019   +0.005
-    #   nose          (never measured by the instrument)
-    # Averaging the weak sites into the face-level value cost roughly half the
-    # signal: phone all-ROIs +0.137 vs cheeks-only +0.176 on the same weights.
+  pores:
+    # Aggregated over the CHEEKS ONLY, because that is where the instrument
+    # counted pores (faceparts 5/6). Held-out subject-level agreement with the
+    # mean cheek pore count, same weights, varying only the ROIs averaged in:
+    #   cheeks            +0.591      nose only       +0.391
+    #   cheeks + nose     +0.575      forehead only   +0.357
+    #   cheeks + forehead +0.573      all five ROIs   +0.545
+    # The T-zone is not blind -- pore burden correlates across the face -- but
+    # it is measured against a cheek label, and averaging it in dilutes.
+    # Restricting to the calibrated sites is also what keeps the anchors and
+    # the quantile grid below meaningful: both are cheek statistics.
     rois: [left_cheek, right_cheek]
-    # Feature set from an exhaustive subset search over ALL extracted hydration
-    # features on the cheeks (fit on train, evaluated on held-out subjects,
-    # n=642 cheek rows). Three of the candidates -- glcm_correlation,
-    # glcm_energy, lbp_uniformity -- had been extracted all along but were never
-    # allowed into the composite; two of them turn out to matter:
-    #   {scaling_index 0.75, wrinkle_density 0.25}                  +0.240
-    #   {scaling_index +0.45, glcm_contrast -0.30, lbp_uniformity -0.25}
-    #                                                               +0.315
-    # Gain +0.074, subject-bootstrap 95% CI [+0.004, +0.144]. Selection by
-    # TRAIN rho lands on the same family, so this is not val-shopping.
-    # `glcm_contrast` returns as a SUPPRESSOR (negative weight): alone it is
-    # ~uncorrelated on the cheeks, but it cancels illumination-driven variance
-    # shared with scaling_index. `wrinkle_density` fits to ~-0.02 and is
-    # dropped. Per device: phone +0.29 / tablet +0.39 / DSLR +0.34.
-    # NOTE this metric remains a PROXY. +0.32 is a moderate ranking, not a
-    # moisture measurement; the Corneometer reads stratum-corneum capacitance,
-    # which has no direct optical counterpart. `is_estimate` stays True.
-    weights: { scaling_index: 0.45, glcm_contrast: -0.30, lbp_uniformity: -0.25 }
+    # Exhaustive subset search over every extracted feature on the cheeks (fit
+    # on train, scored on held-out subjects; n=642 cheek rows / 321 subjects),
+    # target = the instrument pore count.
+    #   lbp_uniformity alone                            -0.581
+    #   the three below                                 +0.575
+    #   best four-feature set                           +0.576  (dropped)
+    # The fourth feature buys +0.001, so the set stops at three. Pigmentation
+    # features were in the search pool and none entered: this is a texture
+    # measurement, not a colour one, which is also why it survives a change of
+    # camera. Per device: phone +0.558 / tablet +0.576 / DSLR +0.635.
+    #
+    # This is the strongest metric in the system, and unlike the moisture proxy
+    # it replaced it is not an age detector in disguise: partialling age out of
+    # lbp_uniformity leaves -0.557 of the -0.581. Pores are sub-millimetre pits
+    # that the camera genuinely resolves.
+    #
+    # `glcm_contrast` is a SUPPRESSOR (negative weight, tiny): it cancels
+    # illumination-driven variance shared with scaling_index. Do not delete it
+    # for being negative -- see CLAUDE.md.
+    weights: { lbp_uniformity: -0.78, scaling_index: 0.13, glcm_contrast: -0.09 }
     anchors:
       # Cohort-fitted fallbacks (calibration_profile.yaml overrides these).
+      # Cheek statistics, so they carry over unchanged from the moisture metric:
+      # same features, same ROIs, only the target and the weights differ.
       scaling_index:  { mean: 0.002023, std: 0.000969 }
       glcm_contrast:  { mean: 0.798882, std: 0.225395 }
       lbp_uniformity: { mean: 0.212834, std: 0.031372 }
