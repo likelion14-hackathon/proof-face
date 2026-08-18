@@ -12,6 +12,29 @@
 
 ## 현재 상태 (2026-08-15 기준)
 
+### 배포 자동화 (2026-08-19) — Ubuntu 서버 CD
+
+Spring Boot(`likelion14-hackathon/notdesign-server`)가 도는 **같은 Ubuntu 서버**에
+이 API를 붙였습니다. `notdesign-server`의 `.github/workflows/ci.yml`과 같은 패턴이고
+**시크릿도 같은 값**(`SERVER_HOST` / `SERVER_USER` / `SSH_PRIVATE_KEY`, proof-face 저장소에
+이미 등록돼 있음)을 씁니다.
+
+- `publish-image.yml`에 **`deploy` 잡 추가**(`needs: publish`). 별도 워크플로를 만들면
+  이미지를 두 번 빌드하게 되므로 기존 워크플로를 확장했습니다.
+- 서버 사전 준비는 **docker + `/root/proof-face.env`(이 저장소 `.env`를 그 이름으로 저장)**
+  뿐입니다. **ghcr 로그인은 잡이 자기 `GITHUB_TOKEN`으로 매번** 하므로 서버에
+  `read:packages` PAT을 둘 필요가 없습니다(README의 수동 pull 절차에는 여전히 필요).
+- **루프백 전용 배포**: `-p 127.0.0.1:8000:8000`. Spring 컨테이너가 `--network host`라서
+  `SERVICES_ANALYZE_URL=http://127.0.0.1:8000`으로 닿습니다. 인증·레이트리밋이 없으니
+  8000을 보안 그룹에 열지 마세요.
+- **배포 태그는 커밋 SHA**(`:latest` 아님). 잡이 `/healthz` 200을 최대 90초 기다리고,
+  실패하면 컨테이너 로그 50줄을 남기고 job을 실패시킵니다.
+- **리소스는 compose보다 낮게**: `--memory 2g` + `MAX_CONCURRENCY=1`(compose는 4g / 2건).
+  Spring과 인스턴스를 공유하기 때문입니다. 16MP 1건 피크 RSS가 약 1GB.
+- ⚠️ **`-e`는 `--env-file`을 덮어씁니다**(docker가 env-file을 먼저 적용). 워크플로가 API
+  튜닝 노브를 `-e`로 박아 두므로, `/root/proof-face.env`에서 같은 이름을 바꿔도 안 먹습니다.
+  바꾸려면 워크플로를 고치세요. Redis 접속 정보만 env 파일 담당입니다.
+
 ### 최신 라운드 (수분력 → 모공 교체)
 
 팀 회의 결과 "수분력을 모공·탄력으로 바꾸자"는 요청이 왔고, 실측으로 검토해

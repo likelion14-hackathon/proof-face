@@ -1,4 +1,5 @@
-# Build the API image and publish it to GitHub Packages (ghcr.io).
+# Build the API image, publish it to GitHub Packages (ghcr.io), then roll it
+# out to the Ubuntu host over SSH (same server as notdesign-server).
 #
 # Runs on the GitHub runner, so no local Docker credentials are involved: the
 # automatic GITHUB_TOKEN already carries `packages: write` for this repo's org.
@@ -6,10 +7,10 @@
 # builds natively -- cross-building amd64 on an Apple Silicon mac goes through
 # QEMU and takes several times longer.
 #
-# Pull the result on EC2 with:
-#   docker pull ghcr.io/likelion14-hackathon/skin-metrics-api:latest
 # The package inherits the repository's visibility, so while the repo is
-# private the EC2 host must `docker login ghcr.io` with a read:packages token.
+# private a pull needs credentials; the deploy job below logs in with its own
+# GITHUB_TOKEN, so only manual pulls need a read:packages PAT:
+#   docker pull ghcr.io/likelion14-hackathon/skin-metrics-api:latest
 
 name: Publish image
 
@@ -81,3 +82,87 @@ jobs:
             echo "docker pull ${IMAGE}:${GITHUB_SHA}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # SSH into the Ubuntu host and swap the container for the freshly built image.
+  #
+  # The API is published on loopback only (127.0.0.1:8000): the Spring Boot
+  # container runs with `--network host`, so it reaches this at
+  # SERVICES_ANALYZE_URL=http://127.0.0.1:8000, and nothing outside the
+  # instance can hit /analyze (there is still no auth or rate limiting).
+  #
+  # Host prerequisites: docker, and /root/proof-face.env holding the Redis
+  # credentials (this repo's .env, saved under that name). No ghcr login is
+  # needed up front -- the job logs in with its own GITHUB_TOKEN below, which
+  # is what lets it pull while the package is private.
+  deploy:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: appleboy/ssh-action@v1
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Deploy the exact commit, not :latest -- unambiguous and rollbackable.
+          IMAGE_REF: ${{ env.IMAGE }}:${{ github.sha }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: GHCR_USER,GHCR_TOKEN,IMAGE_REF
+          script: |
+            set -eu
+
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            docker pull "$IMAGE_REF"
+            docker logout ghcr.io
+
+            docker rm -f skin-metrics-api || true
+
+            # The -e flags below override anything with the same name in the
+            # env file (docker applies --env-file first). They are the
+            # docker-compose.yml values, tuned down for a host shared with the
+            # Spring app: one analysis at a time, ~1GB peak RSS at 16MP.
+            docker run -d --name skin-metrics-api \
+              --restart unless-stopped \
+              -p 127.0.0.1:8000:8000 \
+              --env-file /root/proof-face.env \
+              -e SKIN_METRICS_API_MAX_CONCURRENCY=1 \
+              -e SKIN_METRICS_API_MAX_PIXELS=40000000 \
+              -e SKIN_METRICS_API_ANALYSIS_MAX_PIXELS=16000000 \
+              -e SKIN_METRICS_API_MAX_BYTES=20971520 \
+              -e SKIN_METRICS_API_FETCH_TIMEOUT=10.0 \
+              -e SKIN_METRICS_API_ALLOW_PRIVATE_HOSTS=0 \
+              -e MPLCONFIGDIR=/tmp/mpl \
+              --memory 2g --cpus 2 \
+              --read-only --tmpfs /tmp:rw,size=64m \
+              --security-opt no-new-privileges:true \
+              "$IMAGE_REF"
+
+            # Fail the deploy loudly instead of leaving a dead container up.
+            # Startup loads mediapipe + the config, so give it ~90s. curl is
+            # not guaranteed on a minimal host; the container always has python.
+            probe() {
+              if command -v curl > /dev/null 2>&1; then
+                curl -fsS http://127.0.0.1:8000/healthz
+              else
+                docker exec skin-metrics-api python -c \
+                  "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4).read().decode())"
+              fi
+            }
+
+            for _ in $(seq 1 30); do
+              if probe > /dev/null 2>&1; then
+                echo "healthy:"
+                probe
+                docker image prune -f
+                exit 0
+              fi
+              sleep 3
+            done
+
+            echo "health check never passed:" >&2
+            docker logs --tail 50 skin-metrics-api >&2
+            exit 1

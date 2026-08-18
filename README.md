@@ -1059,7 +1059,7 @@ Hub만 있으면 된다(일부 네트워크에서 ghcr 익명 pull이 막힌다)
 ### AWS EC2 배포
 
 **아키텍처 주의**: 맥에서 `docker build`로 만든 기본 이미지는 arm64라서 x86_64 EC2에 올리면
-`exec format error`로 죽는다. GitHub Actions가 amd64로 빌드해 주므로 방법 A(ghcr pull)에는
+`exec format error`로 죽는다. GitHub Actions가 amd64로 빌드해 주므로 방법 A·B(ghcr pull)에는
 이 문제가 없다.
 
 #### 1. 인스턴스 선택
@@ -1092,7 +1092,36 @@ docker compose version
 
 > Ubuntu에서는 `sudo apt install -y docker.io docker-compose-v2 git` 로 대체된다.
 
-#### 3-A. 배포 방법 A: GitHub Packages에서 pull (권장)
+#### 3-A. 배포 방법 A: GitHub Actions 자동 배포 (현재 구성)
+
+`.github/workflows/publish-image.yml`의 `deploy` 잡이 이미지를 ghcr에 올린 뒤 서버에 SSH로
+붙어 컨테이너를 교체한다. Spring Boot(`notdesign-server`)와 **같은 서버·같은 시크릿**을 쓴다.
+
+- **트리거**: `main` 푸시(경로 필터에 걸리는 변경) 또는 Actions 탭의 *Run workflow*.
+- **저장소 시크릿**: `SERVER_HOST` / `SERVER_USER` / `SSH_PRIVATE_KEY`.
+  `notdesign-server`와 같은 값이다.
+- **서버 사전 준비는 두 가지뿐**:
+  1. docker 설치 (`sudo apt install -y docker.io`)
+  2. `/root/proof-face.env` — 이 저장소의 `.env`(Redis 접속 정보)를 그 이름으로 저장.
+     `notdesign-server`의 `/root/proof.env`와 나란히 두면 된다.
+
+  ghcr 로그인은 잡이 매번 자신의 `GITHUB_TOKEN`으로 하므로 **서버에 PAT을 둘 필요가 없다**
+  (패키지가 private이어도 된다).
+- **실행 형태**: `-p 127.0.0.1:8000:8000`(루프백 전용), `--restart unless-stopped`,
+  `--memory 2g --cpus 2`, `--read-only`. Spring이 `--network host`로 도니
+  `SERVICES_ANALYZE_URL=http://127.0.0.1:8000`으로 부르면 된다. 인증·레이트리밋이 없는
+  상태이므로 보안 그룹에 8000을 여는 대신 루프백에 묶어 두는 쪽이 맞다.
+- **배포 태그는 `:latest`가 아니라 커밋 SHA**다. 잡은 `/healthz`가 200을 낼 때까지 최대
+  90초 기다리고, 그때까지 못 뜨면 컨테이너 로그 50줄을 남기고 실패한다.
+- **롤백**: 직전 성공 실행을 *Re-run jobs* 하거나, 서버에서 원하는 SHA 태그로 직접
+  `docker run`(방법 B).
+
+> 메모리는 compose(4g / 동시 2건)보다 낮은 `--memory 2g` + `MAX_CONCURRENCY=1`로 잡아
+> 뒀다. 같은 인스턴스에서 Spring이 함께 돌기 때문이다. 16MP 입력 1건의 피크 RSS가 약 1GB
+> 이므로 여유는 있지만, 인스턴스를 키웠다면 워크플로의 `--memory`와
+> `SKIN_METRICS_API_MAX_CONCURRENCY`를 같이 올린다.
+
+#### 3-B. 배포 방법 B: GitHub Packages에서 수동 pull
 
 이미지는 GitHub Actions가 빌드해 ghcr.io에 올린다(`.github/workflows/publish-image.yml`).
 `main`에 푸시하면 자동으로 돌고, Actions 탭의 "Publish image" 에서 *Run workflow* 로 수동
@@ -1141,7 +1170,7 @@ docker run -d --name skin-metrics --restart unless-stopped \
 > *Run workflow* 에서 platforms 입력을 `linux/amd64,linux/arm64`로 주면 된다(arm64는 러너에서
 > 에뮬레이션되어 빌드가 몇 배 느리다).
 
-#### 3-B. 배포 방법 B: 저장소 클론 후 인스턴스에서 빌드
+#### 3-C. 배포 방법 C: 저장소 클론 후 인스턴스에서 빌드
 
 ```bash
 git clone https://github.com/likelion14-hackathon/proof-face.git
@@ -1169,7 +1198,8 @@ curl http://<EC2-퍼블릭-IP>:8000/results/<request_id>:diary
 전달됐지만 접속이 안 되는 것(방화벽, 자격증명, 인스턴스 다운)이고, 컨테이너가 아예 안 뜬다면
 `docker logs`에 `SKIN_METRICS_REDIS_HOST is not set`이 찍혀 있다.
 
-재배포는 방법 A의 경우 새 이미지를 pull한 뒤 컨테이너를 재생성하고, 방법 B는
+재배포는 방법 A라면 `main`에 푸시하는 것으로 끝이고, 방법 B는 새 이미지를 pull한 뒤
+컨테이너를 재생성하고, 방법 C는
 `git pull && SKIN_METRICS_BIND=0.0.0.0 ./redeploy.sh` 다. 두 방법 모두
 `restart: unless-stopped`라 인스턴스를 재부팅해도 컨테이너가 살아난다.
 
